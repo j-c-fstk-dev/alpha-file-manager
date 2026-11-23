@@ -12,7 +12,9 @@ nativos e funciona sem WebView.
 - Navegação em abas e painel duplo com barra de endereço e histórico por painel.
 - Barra lateral recolhível com pastas padrão e atalhos fixados, compartilhados com a tela inicial.
 - Banner panorâmico personalizável pelo botão de imagem na tela inicial.
-- Miniaturas de imagens visíveis, ícones por tipo e ordenação por nome, tamanho, tipo e datas.
+- Visualização em lista e em ícones, miniaturas de imagens, ícones por tipo e ordenação por nome, tamanho, tipo e datas.
+- Campo de busca no cabeçalho: digite um caminho para abri-lo ou um texto para filtrar a pasta atual.
+- Carregamento rápido de pastas grandes, lidas em segundo plano sem travar a janela.
 - Menus de contexto para propriedades, cópia, movimentação, renomeação e lixeira.
 - Perfis verde fósforo, âmbar, ciano e violeta, com opção de transparência nas Configurações.
 - Lançador e opção de associação como gerenciador padrão, incluindo integração com o Xfce.
@@ -25,7 +27,7 @@ visual dentro da interface.
 
 ### Pacote de release para Linux x86-64
 
-Extraia o arquivo `alpha-file-manager-v0.2.0-linux-x86_64.tar.gz` e, na pasta extraída, execute:
+Extraia o arquivo `alpha-file-manager-v0.3.0-linux-x86_64.tar.gz` e, na pasta extraída, execute:
 
 ```sh
 ./install-launcher.sh
@@ -51,7 +53,7 @@ Para abrir uma pasta específica, passe seu caminho como argumento.
 
 O idioma segue a configuração do sistema (português ou inglês). A engrenagem também permite
 ajustar a opacidade entre 60% e 100% com a transparência ativa. Os menus no cabeçalho
-mostram os atalhos disponíveis.
+mostram os atalhos disponíveis, e **Ctrl+K** leva ao campo de busca.
 
 - Use o botão de imagem no banner para escolher outra imagem ou restaurar a original.
 - Use a engrenagem para alterar o perfil de cores, ativar transparência ou selecionar o Alpha como padrão.

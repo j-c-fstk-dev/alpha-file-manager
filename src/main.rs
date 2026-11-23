@@ -13,8 +13,19 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::mpsc::{self, TryRecvError},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// Rows inserted into the model per idle callback, so huge folders never block the UI.
+const CHUNK: usize = 1500;
+/// Thumbnails are decoded once at this size and scaled down where they are drawn.
+const THUMBNAIL: i32 = 96;
+/// Width of one cell in the icon view, before zoom.
+const ICON_WIDTH: i32 = 120;
+/// Header height, shared by the sidebar brand row so both bars line up.
+const BAR_HEIGHT: i32 = 58;
+const SIDEBAR_WIDTH: i32 = 220;
 
 #[derive(Clone, Default)]
 struct Transfer {
@@ -22,10 +33,49 @@ struct Transfer {
     moving: bool,
 }
 
+/// One directory entry, read off the UI thread. Everything displayed is pre-formatted here.
+#[derive(Clone)]
+struct Entry {
+    path: PathBuf,
+    name: String,
+    key: String,
+    hidden: bool,
+    directory: bool,
+    kind: &'static str,
+    icon: &'static str,
+    bytes: Option<u64>,
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+    size_text: String,
+    created_text: String,
+    modified_text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    List,
+    Icons,
+}
+
 struct Browser {
     root: glib::WeakRef<gtk::Box>,
     view: gtk::TreeView,
-    store: gtk::ListStore,
+    icons: gtk::IconView,
+    views: gtk::Stack,
+    mode: Cell<ViewMode>,
+    // Replaced wholesale on each load, so the filter never sees the per-row inserts.
+    store: RefCell<gtk::ListStore>,
+    filtered: RefCell<gtk::TreeModelFilter>,
+    filter_state: Rc<RefCell<(String, bool)>>,
+    entries: RefCell<Vec<Entry>>,
+    unreadable: Cell<usize>,
+    error: RefCell<Option<String>>,
+    notice: RefCell<Option<String>>,
+    load_gen: Cell<u64>,
+    populate_gen: Cell<u64>,
+    loading: Cell<bool>,
+    search_gen: Cell<u64>,
+    sort_combo: gtk::ComboBoxText,
     paths: Rc<RefCell<Vec<PathBuf>>>,
     history: Rc<RefCell<Vec<PathBuf>>>,
     forward: RefCell<Vec<PathBuf>>,
@@ -41,6 +91,121 @@ struct Browser {
     focus_stamp: Cell<u64>,
     thumbnails: RefCell<VecDeque<i32>>,
     thumbnail_pending: Cell<bool>,
+}
+
+fn list_store() -> gtk::ListStore {
+    gtk::ListStore::new(&[
+        u32::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        gtk::gdk_pixbuf::Pixbuf::static_type(),
+        String::static_type(),
+        bool::static_type(),
+    ])
+}
+
+/// Filters a store by the shared (text, show hidden) state.
+fn build_filter(
+    store: &gtk::ListStore,
+    filter_state: &Rc<RefCell<(String, bool)>>,
+) -> gtk::TreeModelFilter {
+    let filtered = gtk::TreeModelFilter::new(store, None);
+    let state = filter_state.clone();
+    filtered.set_visible_func(move |model, iter| {
+        let state = state.borrow();
+        let (text, show_hidden) = &*state;
+        if !show_hidden && model.value(iter, 9).get::<bool>().unwrap_or(false) {
+            return false;
+        }
+        text.is_empty()
+            || model
+                .value(iter, 8)
+                .get::<String>()
+                .is_ok_and(|key| key.contains(text.as_str()))
+    });
+    filtered
+}
+
+/// Reads one directory. Runs on a worker thread: no GTK calls here.
+fn scan(folder: &Path) -> Result<(Vec<Entry>, usize), String> {
+    let entries = fs::read_dir(folder).map_err(|error| error.to_string())?;
+    let mut rows = Vec::new();
+    let mut unreadable = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unreadable += 1;
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let metadata = entry.metadata().ok();
+        let link = metadata.as_ref().is_some_and(|meta| meta.is_symlink());
+        let directory =
+            metadata.as_ref().is_some_and(|meta| meta.is_dir()) || (link && path.is_dir());
+        let bytes = metadata
+            .as_ref()
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len());
+        let created = metadata.as_ref().and_then(|meta| meta.created().ok());
+        let modified = metadata.as_ref().and_then(|meta| meta.modified().ok());
+        let (kind, icon) = file_display(&path, directory, link);
+        rows.push(Entry {
+            key: name.to_lowercase(),
+            hidden: name.starts_with('.'),
+            size_text: bytes.map(format_size).unwrap_or_default(),
+            created_text: display_date(created),
+            modified_text: display_date(modified),
+            path,
+            name,
+            directory,
+            kind,
+            icon,
+            bytes,
+            created,
+            modified,
+        });
+    }
+    Ok((rows, unreadable))
+}
+
+/// Same ordering rules as before: folders first, then the selected column.
+fn sort_rows(rows: &mut [Entry], property: i32, descending: bool) {
+    rows.sort_unstable_by(|a, b| {
+        let order = match property {
+            2 => a.kind.cmp(b.kind),
+            3 => optional_order(a.bytes, b.bytes, descending),
+            5 => optional_order(a.created, b.created, descending),
+            6 => optional_order(a.modified, b.modified, descending),
+            _ => a.key.cmp(&b.key),
+        };
+        let ordered = if descending && matches!(property, 1 | 2) {
+            order.reverse()
+        } else {
+            order
+        };
+        (!a.directory)
+            .cmp(&!b.directory)
+            .then(ordered)
+            .then_with(|| (&a.key, &a.path).cmp(&(&b.key, &b.path)))
+    });
+}
+
+/// Scales a pixbuf down to fit a square, keeping its aspect ratio.
+fn fit(pixbuf: &gtk::gdk_pixbuf::Pixbuf, max: i32) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    let (width, height) = (pixbuf.width(), pixbuf.height());
+    if width <= max && height <= max {
+        return Some(pixbuf.clone());
+    }
+    let ratio = f64::from(max) / f64::from(width.max(height));
+    pixbuf.scale_simple(
+        (f64::from(width) * ratio).round().max(1.0) as i32,
+        (f64::from(height) * ratio).round().max(1.0) as i32,
+        gtk::gdk_pixbuf::InterpType::Bilinear,
+    )
 }
 
 impl Browser {
@@ -76,7 +241,37 @@ impl Browser {
         let copy = icon_button("edit-copy-symbolic", tr!("Copiar", "Copy"));
         let cut = icon_button("edit-cut-symbolic", tr!("Recortar", "Cut"));
         let paste = icon_button("edit-paste-symbolic", tr!("Colar", "Paste"));
+        let sort_combo = gtk::ComboBoxText::new();
+        for (id, label) in [
+            ("1", tr!("Nome", "Name")),
+            ("2", tr!("Tipo", "Type")),
+            ("3", tr!("Tamanho", "Size")),
+            ("6", tr!("Modificação", "Modified")),
+        ] {
+            sort_combo.append(Some(id), label);
+        }
+        sort_combo.set_active_id(Some("1"));
+        label_control(&sort_combo, tr!("Ordenar por", "Sort by"));
+        let list_mode = gtk::ToggleButton::new();
+        list_mode.add(&gtk::Image::from_icon_name(
+            Some("view-list-symbolic"),
+            gtk::IconSize::Button,
+        ));
+        label_control(&list_mode, tr!("Visualização em lista", "List View"));
+        let icon_mode = gtk::ToggleButton::new();
+        icon_mode.add(&gtk::Image::from_icon_name(
+            Some("view-grid-symbolic"),
+            gtk::IconSize::Button,
+        ));
+        label_control(&icon_mode, tr!("Visualização em ícones", "Icon View"));
+        list_mode.set_active(true);
+        let modes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        modes.style_context().add_class("linked");
+        modes.pack_start(&list_mode, false, false, 0);
+        modes.pack_start(&icon_mode, false, false, 0);
         actions.pack_start(&filter, true, true, 0);
+        actions.pack_start(&sort_combo, false, false, 0);
+        actions.pack_start(&modes, false, false, 0);
         for button in [
             hidden.upcast_ref(),
             &create,
@@ -90,17 +285,12 @@ impl Browser {
         }
         root.pack_start(&actions, false, false, 0);
 
-        let store = gtk::ListStore::new(&[
-            u32::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            gtk::gdk_pixbuf::Pixbuf::static_type(),
-        ]);
-        let view = gtk::TreeView::with_model(&store);
+        // Columns: 0 index, 1 name, 2 type, 3 size, 4 icon, 5 created, 6 modified,
+        // 7 thumbnail, 8 lowercase name (filter key), 9 hidden flag.
+        let store = list_store();
+        let filter_state = Rc::new(RefCell::new((String::new(), false)));
+        let filtered = build_filter(&store, &filter_state);
+        let view = gtk::TreeView::with_model(&filtered);
         view.selection().set_mode(gtk::SelectionMode::Multiple);
         for (index, name) in [
             (1, tr!("Nome", "Name")),
@@ -141,7 +331,7 @@ impl Browser {
                         renderer.set_property("pixbuf", Option::<gtk::gdk_pixbuf::Pixbuf>::None);
                         renderer.set_property("icon-name", Option::<String>::None);
                         if let Some(preview) = preview {
-                            renderer.set_property("pixbuf", preview);
+                            renderer.set_property("pixbuf", fit(&preview, 24));
                         } else {
                             renderer.set_property("icon-name", name);
                         }
@@ -152,10 +342,57 @@ impl Browser {
             gtk::prelude::TreeViewColumnExt::add_attribute(&column, &renderer, "text", index);
             view.append_column(&column);
         }
-        let scroll = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-        scroll.style_context().add_class("file-surface");
-        scroll.add(&view);
-        root.pack_start(&scroll, true, true, 0);
+        let list_scroll =
+            gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+        list_scroll.style_context().add_class("file-surface");
+        list_scroll.add(&view);
+
+        let icons = gtk::IconView::new();
+        icons.set_model(Some(&filtered));
+        icons.set_selection_mode(gtk::SelectionMode::Multiple);
+        icons.set_item_orientation(gtk::Orientation::Vertical);
+        icons.set_item_width(ICON_WIDTH);
+        icons.set_spacing(6);
+        icons.set_item_padding(10);
+        let icon_pixbuf = gtk::CellRendererPixbuf::new();
+        // GtkIconSize Dialog (48px) for themed icons; the property is a plain uint.
+        icon_pixbuf.set_property("stock-size", 6u32);
+        gtk::prelude::CellLayoutExt::pack_start(&icons, &icon_pixbuf, false);
+        gtk::prelude::CellLayoutExt::set_cell_data_func(
+            &icons,
+            &icon_pixbuf,
+            Some(Box::new(|_, renderer, model, iter| {
+                let preview = model
+                    .value(iter, 7)
+                    .get::<Option<gtk::gdk_pixbuf::Pixbuf>>()
+                    .unwrap_or_default();
+                let name = model.value(iter, 4).get::<String>().unwrap_or_default();
+                renderer.set_property("pixbuf", Option::<gtk::gdk_pixbuf::Pixbuf>::None);
+                renderer.set_property("icon-name", Option::<String>::None);
+                if let Some(preview) = preview {
+                    renderer.set_property("pixbuf", fit(&preview, 64));
+                } else {
+                    renderer.set_property("icon-name", name);
+                }
+            })),
+        );
+        let icon_text = gtk::CellRendererText::new();
+        icon_text.set_property("wrap-width", ICON_WIDTH - 24);
+        icon_text.set_property("wrap-mode", gtk::pango::WrapMode::WordChar);
+        icon_text.set_property("alignment", gtk::pango::Alignment::Center);
+        icon_text.set_xalign(0.5);
+        gtk::prelude::CellLayoutExt::pack_start(&icons, &icon_text, true);
+        gtk::prelude::CellLayoutExt::add_attribute(&icons, &icon_text, "text", 1);
+        let icon_scroll =
+            gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+        icon_scroll.style_context().add_class("file-surface");
+        icon_scroll.add(&icons);
+
+        let views = gtk::Stack::new();
+        views.add_named(&list_scroll, "list");
+        views.add_named(&icon_scroll, "icons");
+        views.set_visible_child_name("list");
+        root.pack_start(&views, true, true, 0);
         let status = gtk::Label::new(None);
         status.style_context().add_class("muted");
         status.set_xalign(0.0);
@@ -165,7 +402,21 @@ impl Browser {
         let browser = Rc::new(Self {
             root: root.downgrade(),
             view,
-            store,
+            icons,
+            views,
+            mode: Cell::new(ViewMode::List),
+            store: RefCell::new(store),
+            filtered: RefCell::new(filtered),
+            filter_state,
+            entries: Default::default(),
+            unreadable: Cell::default(),
+            error: Default::default(),
+            notice: Default::default(),
+            load_gen: Cell::default(),
+            populate_gen: Cell::default(),
+            loading: Cell::new(true),
+            search_gen: Cell::default(),
+            sort_combo: sort_combo.clone(),
             paths: Default::default(),
             history: Default::default(),
             forward: Default::default(),
@@ -195,19 +446,52 @@ impl Browser {
                     return;
                 };
                 let (old, descending) = state.sort.get();
-                let next = old == id && !descending;
-                state.sort.set((id, next));
-                for (index, col) in [1, 2, 3, 5, 6].into_iter().zip(state.view.columns()) {
-                    col.set_sort_indicator(index == id);
-                    col.set_sort_order(if next {
-                        gtk::SortType::Descending
-                    } else {
-                        gtk::SortType::Ascending
-                    });
-                }
-                state.refresh();
+                state.set_sort(id, old == id && !descending);
             });
         }
+        let state = Rc::downgrade(&browser);
+        sort_combo.connect_changed(move |combo| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let Some(id) = combo.active_id().and_then(|id| id.parse::<i32>().ok()) else {
+                return;
+            };
+            if state.sort.get().0 != id {
+                state.set_sort(id, false);
+            }
+        });
+        // Two toggles acting as one radio group: switch the mode first, then the sibling.
+        let state = Rc::downgrade(&browser);
+        let other = icon_mode.downgrade();
+        list_mode.connect_toggled(move |button| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if button.is_active() {
+                state.set_mode(ViewMode::List);
+                if let Some(other) = other.upgrade() {
+                    other.set_active(false);
+                }
+            } else if state.mode() == ViewMode::List {
+                button.set_active(true);
+            }
+        });
+        let state = Rc::downgrade(&browser);
+        let other = list_mode.downgrade();
+        icon_mode.connect_toggled(move |button| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if button.is_active() {
+                state.set_mode(ViewMode::Icons);
+                if let Some(other) = other.upgrade() {
+                    other.set_active(false);
+                }
+            } else if state.mode() == ViewMode::Icons {
+                button.set_active(true);
+            }
+        });
         let state = Rc::downgrade(&browser);
         browser.view.connect_map(move |_| {
             if let Some(state) = state.upgrade() {
@@ -215,13 +499,27 @@ impl Browser {
             }
         });
         let state = Rc::downgrade(&browser);
-        scroll.vadjustment().connect_value_changed(move |_| {
+        browser.icons.connect_map(move |_| {
+            if let Some(state) = state.upgrade() {
+                state.queue_thumbnails();
+            }
+        });
+        for scroll in [&list_scroll, &icon_scroll] {
+            let state = Rc::downgrade(&browser);
+            scroll.vadjustment().connect_value_changed(move |_| {
+                if let Some(state) = state.upgrade() {
+                    state.queue_thumbnails();
+                }
+            });
+        }
+        let state = Rc::downgrade(&browser);
+        browser.view.connect_size_allocate(move |_, _| {
             if let Some(state) = state.upgrade() {
                 state.queue_thumbnails();
             }
         });
         let state = Rc::downgrade(&browser);
-        browser.view.connect_size_allocate(move |_, _| {
+        browser.icons.connect_size_allocate(move |_, _| {
             if let Some(state) = state.upgrade() {
                 state.queue_thumbnails();
             }
@@ -282,18 +580,38 @@ impl Browser {
         });
         let state = Rc::downgrade(&browser);
         browser.filter.connect_search_changed(move |_| {
-            if let Some(state) = state.upgrade() {
-                state.refresh();
-            }
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            // Debounce: filter once the user pauses typing, not on every keystroke.
+            let generation = state.search_gen.get().wrapping_add(1);
+            state.search_gen.set(generation);
+            let state = Rc::downgrade(&state);
+            glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                if let Some(state) = state.upgrade() {
+                    if state.search_gen.get() == generation {
+                        state.apply_filter();
+                    }
+                }
+            });
         });
         let state = Rc::downgrade(&browser);
         browser.hidden.connect_toggled(move |_| {
             if let Some(state) = state.upgrade() {
-                state.refresh();
+                state.apply_filter();
             }
         });
         let state = Rc::downgrade(&browser);
         browser.view.connect_row_activated(move |_, row, _| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if let Some(path) = state.path_at(row) {
+                state.open(&path);
+            }
+        });
+        let state = Rc::downgrade(&browser);
+        browser.icons.connect_item_activated(move |_, row| {
             let Some(state) = state.upgrade() else {
                 return;
             };
@@ -412,7 +730,7 @@ impl Browser {
             }
             state.refresh();
             if let Some(error) = errors.first() {
-                state.status.set_text(&trf!(
+                state.notify(&trf!(
                     "{} falha(s) · {error}",
                     "{} failure(s) · {error}",
                     errors.len()
@@ -443,168 +761,26 @@ impl Browser {
             let row = view
                 .path_at_pos(x as i32, y as i32)
                 .and_then(|(path, _, _, _)| path);
-            let selection = view.selection();
-            if let Some(row) = row.as_ref() {
-                if !selection.path_is_selected(row) {
-                    selection.unselect_all();
-                    selection.select_path(row);
-                }
-            } else {
-                selection.unselect_all();
-            }
-            let selected = state.selected();
-            let menu = gtk::Menu::new();
-            if let [path] = selected.as_slice() {
-                let target = path.clone();
-                let owner = Rc::downgrade(&state);
-                menu_action(&menu, tr!("Abrir", "Open"), move || {
-                    if let Some(owner) = owner.upgrade() {
-                        owner.open(&target);
-                    }
-                });
-                let target = path.clone();
-                menu_action(&menu, tr!("Copiar caminho", "Copy Path"), move || {
-                    gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD)
-                        .set_text(&target.to_string_lossy());
-                });
-                let target = path.clone();
-                let owner = Rc::downgrade(&state);
-                menu_action(&menu, tr!("Propriedades", "Properties"), move || {
-                    if let Some(owner) = owner.upgrade() {
-                        owner.properties(&target);
-                    }
-                });
-            }
-            let folder_to_pin = match selected.as_slice() {
-                [] => Some(state.folder.borrow().clone()),
-                [path] if path.is_dir() => Some(path.clone()),
-                _ => None,
-            };
-            if let Some(path) = folder_to_pin {
-                let owner = Rc::downgrade(&state);
-                menu_action(
-                    &menu,
-                    tr!(
-                        "Fixar pasta no início e na lateral",
-                        "Pin Folder to Home and Sidebar"
-                    ),
-                    move || {
-                        if let Err(error) = preferences::pin(&path) {
-                            if let Some(owner) = owner.upgrade() {
-                                owner.status.set_text(&error.to_string());
-                            }
-                        }
-                    },
-                );
-            }
-            if let [path] = selected.as_slice() {
-                if path.is_dir() {
-                    let target = path.clone();
-                    let owner = Rc::downgrade(&state);
-                    menu_action(
-                        &menu,
-                        tr!("Abrir em nova janela", "Open in New Window"),
-                        move || {
-                            if let Err(error) = commands::new_window(&target) {
-                                if let Some(owner) = owner.upgrade() {
-                                    owner.status.set_text(&error.to_string());
-                                }
-                            }
-                        },
-                    );
-                    let target = path.clone();
-                    let owner = Rc::downgrade(&state);
-                    menu_action(
-                        &menu,
-                        tr!("Abrir em nova aba", "Open in New Tab"),
-                        move || {
-                            if let Some(owner) = owner.upgrade() {
-                                owner.open_tab(&target);
-                            }
-                        },
-                    );
-                } else {
-                    let target = path.clone();
-                    let owner = Rc::downgrade(&state);
-                    menu_action(&menu, tr!("Abrir com…", "Open With…"), move || {
-                        if let Some(owner) = owner.upgrade() {
-                            owner.open_with(&target);
-                        }
-                    });
-                }
-            }
-            if selected.is_empty()
-                || selected
-                    .as_slice()
-                    .first()
-                    .is_some_and(|path| selected.len() == 1 && path.is_dir())
-            {
-                let directory = selected
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| state.folder.borrow().clone());
-                let owner = Rc::downgrade(&state);
-                menu_action(
-                    &menu,
-                    tr!("Abrir terminal aqui", "Open Terminal Here"),
-                    move || {
-                        if let Err(error) = commands::terminal(&directory) {
-                            if let Some(owner) = owner.upgrade() {
-                                owner.status.set_text(&error.to_string());
-                            }
-                        }
-                    },
-                );
-            }
-            let commands = [
-                ("new-folder", tr!("Nova pasta", "New Folder")),
-                ("paste", tr!("Colar", "Paste")),
-                (
-                    "empty-file",
-                    tr!("Criar arquivo vazio", "Create Empty File"),
-                ),
-                ("copy", tr!("Copiar", "Copy")),
-                ("cut", tr!("Recortar", "Cut")),
-                ("rename", tr!("Renomear", "Rename")),
-                ("trash", tr!("Mover para a lixeira", "Move to Trash")),
-            ];
-            for (name, label) in commands {
-                let enabled = match name {
-                    "new-folder" | "paste" | "empty-file" => true,
-                    "rename" => selected.len() == 1,
-                    _ => !selected.is_empty(),
-                };
-                if enabled {
-                    let owner = Rc::downgrade(&state);
-                    menu_action(&menu, label, move || {
-                        if let Some(owner) = owner.upgrade() {
-                            owner.dispatch(name);
-                        }
-                    });
-                }
-            }
-            if !selected.is_empty() {
-                let owner = Rc::downgrade(&state);
-                menu_action(
-                    &menu,
-                    tr!("Excluir permanentemente…", "Delete Permanently…"),
-                    move || {
-                        if let Some(owner) = owner.upgrade() {
-                            owner.dispatch("delete");
-                        }
-                    },
-                );
-            } else {
-                let owner = Rc::downgrade(&state);
-                menu_action(&menu, tr!("Recarregar", "Reload"), move || {
-                    if let Some(owner) = owner.upgrade() {
-                        owner.dispatch("reload");
-                    }
-                });
-            }
-            show_menu(&menu, event);
+            state.prepare_selection(row.as_ref());
+            show_context_menu(&state, event);
             glib::Propagation::Stop
         });
+        let state = Rc::downgrade(&browser);
+        browser
+            .icons
+            .connect_button_press_event(move |icons, event| {
+                if event.button() != 3 {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(state) = state.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                let (x, y) = event.position();
+                let row = icons.path_at_pos(x as i32, y as i32);
+                state.prepare_selection(row.as_ref());
+                show_context_menu(&state, event);
+                glib::Propagation::Stop
+            });
         (browser, root)
     }
 
@@ -677,7 +853,7 @@ impl Browser {
     }
 
     fn load_thumbnails(&self) -> bool {
-        let Some((start, end)) = self.view.visible_range() else {
+        let Some((start, end)) = self.visible_range() else {
             return false;
         };
         let (Some(first), Some(last)) = (
@@ -689,14 +865,23 @@ impl Browser {
         let paths = self.paths.borrow();
         let mut cached = self.thumbnails.borrow_mut();
         let mut attempted = 0;
-        for index in first..=last.min(first.saturating_add(119)) {
+        // Positions are in the filtered (visible) model; the store is indexed by entry.
+        for position in first..=last.min(first.saturating_add(119)) {
+            let Some(row) = self.filtered().iter_nth_child(None, position) else {
+                continue;
+            };
+            let Ok(index) = self.filtered().value(&row, 0).get::<u32>() else {
+                continue;
+            };
+            let index = index as i32;
             if cached.contains(&index) {
                 continue;
             }
-            let Some(iter) = self.store.iter_nth_child(None, index) else {
+            let Some(iter) = self.store().iter_nth_child(None, index) else {
                 continue;
             };
-            if self.store.value(&iter, 2).get::<String>().as_deref() != Ok(tr!("Imagem", "Image")) {
+            if self.store().value(&iter, 2).get::<String>().as_deref() != Ok(tr!("Imagem", "Image"))
+            {
                 continue;
             }
             let Some(path) = paths.get(index as usize) else {
@@ -708,14 +893,14 @@ impl Browser {
             attempted += 1;
             cached.push_back(index);
             if let Some(preview) = image_thumbnail(path) {
-                self.store.set_value(&iter, 7, &preview.to_value());
+                self.store().set_value(&iter, 7, &preview.to_value());
             }
             if cached.len() > 160 {
                 if let Some(old) = cached
                     .pop_front()
-                    .and_then(|row| self.store.iter_nth_child(None, row))
+                    .and_then(|row| self.store().iter_nth_child(None, row))
                 {
-                    self.store.set_value(
+                    self.store().set_value(
                         &old,
                         7,
                         &Option::<gtk::gdk_pixbuf::Pixbuf>::None.to_value(),
@@ -765,24 +950,274 @@ impl Browser {
     fn finish<T, E: std::fmt::Display>(self: &Rc<Self>, result: Result<T, E>) {
         self.refresh();
         if let Err(error) = result {
-            self.status.set_text(&error.to_string());
+            self.notify(&error.to_string());
         }
     }
 
+    /// Shows a message in the status bar even though a reload is in flight.
+    fn notify(&self, text: &str) {
+        *self.notice.borrow_mut() = Some(text.to_owned());
+        self.update_status();
+    }
+
     fn path_at(&self, row: &gtk::TreePath) -> Option<PathBuf> {
-        let iter = self.store.iter(row)?;
-        let index = self.store.value(&iter, 0).get::<u32>().ok()?;
+        let iter = self.filtered().iter(row)?;
+        let index = self.filtered().value(&iter, 0).get::<u32>().ok()?;
         self.paths.borrow().get(index as usize).cloned()
     }
 
+    fn store(&self) -> gtk::ListStore {
+        self.store.borrow().clone()
+    }
+
+    fn filtered(&self) -> gtk::TreeModelFilter {
+        self.filtered.borrow().clone()
+    }
+
+    fn mode(&self) -> ViewMode {
+        self.mode.get()
+    }
+
+    fn selected_rows(&self) -> Vec<gtk::TreePath> {
+        match self.mode() {
+            ViewMode::List => self.view.selection().selected_rows().0,
+            ViewMode::Icons => self.icons.selected_items(),
+        }
+    }
+
     fn selected(&self) -> Vec<PathBuf> {
-        self.view
-            .selection()
-            .selected_rows()
-            .0
+        self.selected_rows()
             .iter()
             .filter_map(|row| self.path_at(row))
             .collect()
+    }
+
+    fn select_row(&self, row: &gtk::TreePath) {
+        match self.mode() {
+            ViewMode::List => self.view.selection().select_path(row),
+            ViewMode::Icons => self.icons.select_path(row),
+        }
+    }
+
+    fn unselect_row(&self, row: &gtk::TreePath) {
+        match self.mode() {
+            ViewMode::List => self.view.selection().unselect_path(row),
+            ViewMode::Icons => self.icons.unselect_path(row),
+        }
+    }
+
+    fn row_selected(&self, row: &gtk::TreePath) -> bool {
+        match self.mode() {
+            ViewMode::List => self.view.selection().path_is_selected(row),
+            ViewMode::Icons => self.icons.path_is_selected(row),
+        }
+    }
+
+    fn select_all_rows(&self) {
+        match self.mode() {
+            ViewMode::List => self.view.selection().select_all(),
+            ViewMode::Icons => self.icons.select_all(),
+        }
+    }
+
+    fn unselect_all_rows(&self) {
+        match self.mode() {
+            ViewMode::List => self.view.selection().unselect_all(),
+            ViewMode::Icons => self.icons.unselect_all(),
+        }
+    }
+
+    /// Right-click keeps an existing selection, otherwise selects only the clicked row.
+    fn prepare_selection(&self, row: Option<&gtk::TreePath>) {
+        match row {
+            Some(row) => {
+                if !self.row_selected(row) {
+                    self.unselect_all_rows();
+                    self.select_row(row);
+                }
+            }
+            None => self.unselect_all_rows(),
+        }
+    }
+
+    fn visible_range(&self) -> Option<(gtk::TreePath, gtk::TreePath)> {
+        match self.mode() {
+            ViewMode::List => self.view.visible_range(),
+            ViewMode::Icons => self.icons.visible_range(),
+        }
+    }
+
+    fn set_mode(self: &Rc<Self>, mode: ViewMode) {
+        if self.mode.replace(mode) == mode {
+            return;
+        }
+        self.views.set_visible_child_name(match mode {
+            ViewMode::List => "list",
+            ViewMode::Icons => "icons",
+        });
+        self.queue_thumbnails();
+    }
+
+    fn set_sort(self: &Rc<Self>, property: i32, descending: bool) {
+        self.sort.set((property, descending));
+        for (index, column) in [1, 2, 3, 5, 6].into_iter().zip(self.view.columns()) {
+            column.set_sort_indicator(index == property);
+            column.set_sort_order(if descending {
+                gtk::SortType::Descending
+            } else {
+                gtk::SortType::Ascending
+            });
+        }
+        self.sort_combo.set_active_id(Some(&property.to_string()));
+        // Sorting works on the cached listing, so it never touches the disk.
+        self.populate();
+    }
+
+    fn apply_filter(&self) {
+        let text = self.filter.text().to_lowercase();
+        *self.filter_state.borrow_mut() = (text, self.hidden.is_active());
+        self.filtered().refilter();
+        self.update_status();
+    }
+
+    fn update_status(&self) {
+        if let Some(error) = self.error.borrow().as_ref() {
+            self.status.set_text(error);
+            return;
+        }
+        if self.loading.get() {
+            self.status.set_text(tr!("Carregando…", "Loading…"));
+            return;
+        }
+        if let Some(notice) = self.notice.borrow().as_ref() {
+            self.status.set_text(notice);
+            return;
+        }
+        let shown = self.filtered().iter_n_children(None) as usize;
+        let unreadable = self.unreadable.get();
+        self.status.set_text(&if unreadable == 0 {
+            trf!("{} itens", "{} items", shown)
+        } else {
+            trf!(
+                "{} itens · {unreadable} entradas ilegíveis",
+                "{} items · {unreadable} unreadable entries",
+                shown
+            )
+        });
+    }
+
+    fn refresh(self: &Rc<Self>) {
+        // Any notice belongs to the previous action; callers set a new one after refreshing.
+        *self.notice.borrow_mut() = None;
+        self.thumbnails.borrow_mut().clear();
+        let generation = self.load_gen.get().wrapping_add(1);
+        self.load_gen.set(generation);
+        self.loading.set(true);
+        self.status.set_text(tr!("Carregando…", "Loading…"));
+        let folder = self.folder.borrow().clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(scan(&folder));
+        });
+        let state = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(8), move || {
+            match receiver.try_recv() {
+                Err(TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                Ok(result) => {
+                    if let Some(state) = state.upgrade() {
+                        if state.load_gen.get() == generation {
+                            state.apply(result);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    fn apply(self: &Rc<Self>, result: Result<(Vec<Entry>, usize), String>) {
+        match result {
+            Ok((entries, unreadable)) => {
+                *self.entries.borrow_mut() = entries;
+                self.unreadable.set(unreadable);
+                *self.error.borrow_mut() = None;
+            }
+            Err(error) => {
+                self.entries.borrow_mut().clear();
+                self.unreadable.set(0);
+                *self.error.borrow_mut() = Some(error);
+            }
+        }
+        self.populate();
+    }
+
+    /// Rebuilds the listing from the cached entries, sorted, in chunks across idle callbacks.
+    /// The new store is filled off-screen and swapped in when complete, so the current list
+    /// stays usable and consistent (paths, filter and store always match) while it loads.
+    fn populate(self: &Rc<Self>) {
+        let (property, descending) = self.sort.get();
+        let mut rows = self.entries.borrow().clone();
+        sort_rows(&mut rows, property, descending);
+        // A new sort or a new folder cancels any population still in progress.
+        let generation = self.populate_gen.get().wrapping_add(1);
+        self.populate_gen.set(generation);
+        let scan = self.load_gen.get();
+        self.loading.set(true);
+        let store = list_store();
+        let rows = Rc::new(rows);
+        let next = Cell::new(0usize);
+        let state = Rc::downgrade(self);
+        glib::idle_add_local(move || {
+            let Some(state) = state.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if state.load_gen.get() != scan || state.populate_gen.get() != generation {
+                return glib::ControlFlow::Break;
+            }
+            let start = next.get();
+            let end = (start + CHUNK).min(rows.len());
+            for (offset, entry) in rows[start..end].iter().enumerate() {
+                let index = (start + offset) as u32;
+                store.insert_with_values(
+                    None,
+                    &[
+                        (0, &index),
+                        (1, &entry.name),
+                        (2, &entry.kind),
+                        (3, &entry.size_text),
+                        (4, &entry.icon),
+                        (5, &entry.created_text),
+                        (6, &entry.modified_text),
+                        (8, &entry.key),
+                        (9, &entry.hidden),
+                    ],
+                );
+            }
+            next.set(end);
+            if end < rows.len() {
+                return glib::ControlFlow::Continue;
+            }
+            state.install(
+                store.clone(),
+                rows.iter().map(|entry| entry.path.clone()).collect(),
+            );
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Swaps in a finished listing: the filter is built once over the complete store.
+    fn install(self: &Rc<Self>, store: gtk::ListStore, paths: Vec<PathBuf>) {
+        let filtered = build_filter(&store, &self.filter_state);
+        self.view.set_model(Some(&filtered));
+        self.icons.set_model(Some(&filtered));
+        *self.paths.borrow_mut() = paths;
+        self.thumbnails.borrow_mut().clear();
+        *self.store.borrow_mut() = store;
+        *self.filtered.borrow_mut() = filtered;
+        self.loading.set(false);
+        self.update_status();
+        self.queue_thumbnails();
     }
 
     fn navigate(self: &Rc<Self>, path: &Path, remember: bool) -> bool {
@@ -806,98 +1241,159 @@ impl Browser {
         self.refresh();
         true
     }
+}
 
-    fn refresh(self: &Rc<Self>) {
-        self.thumbnails.borrow_mut().clear();
-        self.store.clear();
-        self.paths.borrow_mut().clear();
-        let folder = self.folder.borrow();
-        let entries = match fs::read_dir(&*folder) {
-            Ok(entries) => entries,
-            Err(error) => {
-                self.status.set_text(&error.to_string());
-                return;
+fn show_context_menu(state: &Rc<Browser>, event: &gdk::EventButton) {
+    let selected = state.selected();
+    let menu = gtk::Menu::new();
+    if let [path] = selected.as_slice() {
+        let target = path.clone();
+        let owner = Rc::downgrade(state);
+        menu_action(&menu, tr!("Abrir", "Open"), move || {
+            if let Some(owner) = owner.upgrade() {
+                owner.open(&target);
             }
-        };
-        let filter = self.filter.text().to_lowercase();
-        let show_hidden = self.hidden.is_active();
-        let mut rows = Vec::new();
-        let mut unreadable = 0;
-        for entry in entries {
-            let Ok(entry) = entry else {
-                unreadable += 1;
-                continue;
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let key = name.to_lowercase();
-            if (!show_hidden && name.starts_with('.')) || !key.contains(&filter) {
-                continue;
+        });
+        let target = path.clone();
+        menu_action(&menu, tr!("Copiar caminho", "Copy Path"), move || {
+            gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD).set_text(&target.to_string_lossy());
+        });
+        let target = path.clone();
+        let owner = Rc::downgrade(state);
+        menu_action(&menu, tr!("Propriedades", "Properties"), move || {
+            if let Some(owner) = owner.upgrade() {
+                owner.properties(&target);
             }
-            let path = entry.path();
-            let metadata = entry.metadata().ok();
-            let link = metadata.as_ref().is_some_and(|meta| meta.is_symlink());
-            let directory =
-                metadata.as_ref().is_some_and(|meta| meta.is_dir()) || (link && path.is_dir());
-            let bytes = metadata
-                .as_ref()
-                .filter(|meta| meta.is_file())
-                .map(|meta| meta.len());
-            let created = metadata.as_ref().and_then(|meta| meta.created().ok());
-            let modified = metadata.as_ref().and_then(|meta| meta.modified().ok());
-            let (kind, icon) = file_display(&path, directory, link);
-            rows.push((
-                !directory, key, name, kind, bytes, path, icon, created, modified,
-            ));
-        }
-        let (property, descending) = self.sort.get();
-        rows.sort_unstable_by(|a, b| {
-            let order = match property {
-                2 => a.3.cmp(b.3),
-                3 => optional_order(a.4, b.4, descending),
-                5 => optional_order(a.7, b.7, descending),
-                6 => optional_order(a.8, b.8, descending),
-                _ => a.1.cmp(&b.1),
-            };
-            let ordered = if descending && matches!(property, 1 | 2) {
-                order.reverse()
-            } else {
-                order
-            };
-            a.0.cmp(&b.0)
-                .then(ordered)
-                .then_with(|| (&a.1, &a.5).cmp(&(&b.1, &b.5)))
         });
-        let mut paths = self.paths.borrow_mut();
-        for (_, _, name, kind, bytes, path, icon, created, modified) in rows {
-            let index = paths.len() as u32;
-            paths.push(path);
-            let size = bytes.map(format_size).unwrap_or_default();
-            let created = display_date(created);
-            let modified = display_date(modified);
-            self.store.insert_with_values(
-                None,
-                &[
-                    (0, &index),
-                    (1, &name),
-                    (2, &kind),
-                    (3, &size),
-                    (4, &icon),
-                    (5, &created),
-                    (6, &modified),
-                ],
-            );
-        }
-        self.status.set_text(&if unreadable == 0 {
-            trf!("{} itens", "{} items", paths.len())
-        } else {
-            trf!(
-                "{} itens · {unreadable} entradas ilegíveis",
-                "{} items · {unreadable} unreadable entries",
-                paths.len()
-            )
-        });
-        self.queue_thumbnails();
     }
+    let folder_to_pin = match selected.as_slice() {
+        [] => Some(state.folder.borrow().clone()),
+        [path] if path.is_dir() => Some(path.clone()),
+        _ => None,
+    };
+    if let Some(path) = folder_to_pin {
+        let owner = Rc::downgrade(state);
+        menu_action(
+            &menu,
+            tr!(
+                "Fixar pasta no início e na lateral",
+                "Pin Folder to Home and Sidebar"
+            ),
+            move || {
+                if let Err(error) = preferences::pin(&path) {
+                    if let Some(owner) = owner.upgrade() {
+                        owner.status.set_text(&error.to_string());
+                    }
+                }
+            },
+        );
+    }
+    if let [path] = selected.as_slice() {
+        if path.is_dir() {
+            let target = path.clone();
+            let owner = Rc::downgrade(state);
+            menu_action(
+                &menu,
+                tr!("Abrir em nova janela", "Open in New Window"),
+                move || {
+                    if let Err(error) = commands::new_window(&target) {
+                        if let Some(owner) = owner.upgrade() {
+                            owner.status.set_text(&error.to_string());
+                        }
+                    }
+                },
+            );
+            let target = path.clone();
+            let owner = Rc::downgrade(state);
+            menu_action(
+                &menu,
+                tr!("Abrir em nova aba", "Open in New Tab"),
+                move || {
+                    if let Some(owner) = owner.upgrade() {
+                        owner.open_tab(&target);
+                    }
+                },
+            );
+        } else {
+            let target = path.clone();
+            let owner = Rc::downgrade(state);
+            menu_action(&menu, tr!("Abrir com…", "Open With…"), move || {
+                if let Some(owner) = owner.upgrade() {
+                    owner.open_with(&target);
+                }
+            });
+        }
+    }
+    if selected.is_empty()
+        || selected
+            .as_slice()
+            .first()
+            .is_some_and(|path| selected.len() == 1 && path.is_dir())
+    {
+        let directory = selected
+            .first()
+            .cloned()
+            .unwrap_or_else(|| state.folder.borrow().clone());
+        let owner = Rc::downgrade(state);
+        menu_action(
+            &menu,
+            tr!("Abrir terminal aqui", "Open Terminal Here"),
+            move || {
+                if let Err(error) = commands::terminal(&directory) {
+                    if let Some(owner) = owner.upgrade() {
+                        owner.status.set_text(&error.to_string());
+                    }
+                }
+            },
+        );
+    }
+    let commands = [
+        ("new-folder", tr!("Nova pasta", "New Folder")),
+        ("paste", tr!("Colar", "Paste")),
+        (
+            "empty-file",
+            tr!("Criar arquivo vazio", "Create Empty File"),
+        ),
+        ("copy", tr!("Copiar", "Copy")),
+        ("cut", tr!("Recortar", "Cut")),
+        ("rename", tr!("Renomear", "Rename")),
+        ("trash", tr!("Mover para a lixeira", "Move to Trash")),
+    ];
+    for (name, label) in commands {
+        let enabled = match name {
+            "new-folder" | "paste" | "empty-file" => true,
+            "rename" => selected.len() == 1,
+            _ => !selected.is_empty(),
+        };
+        if enabled {
+            let owner = Rc::downgrade(state);
+            menu_action(&menu, label, move || {
+                if let Some(owner) = owner.upgrade() {
+                    owner.dispatch(name);
+                }
+            });
+        }
+    }
+    if !selected.is_empty() {
+        let owner = Rc::downgrade(state);
+        menu_action(
+            &menu,
+            tr!("Excluir permanentemente…", "Delete Permanently…"),
+            move || {
+                if let Some(owner) = owner.upgrade() {
+                    owner.dispatch("delete");
+                }
+            },
+        );
+    } else {
+        let owner = Rc::downgrade(state);
+        menu_action(&menu, tr!("Recarregar", "Reload"), move || {
+            if let Some(owner) = owner.upgrade() {
+                owner.dispatch("reload");
+            }
+        });
+    }
+    show_menu(&menu, event);
 }
 
 fn transfer_item(source: &Path, directory: &Path, moving: bool) -> Result<(), glib::Error> {
@@ -1053,7 +1549,6 @@ fn main() -> glib::ExitCode {
         window.set_title("Alpha File Manager");
         window.set_default_size(1120, 680);
         let header = gtk::HeaderBar::new();
-        header.set_title(Some("Alpha File Manager"));
         header.style_context().add_class("glass-toolbar");
         let toggle_sidebar = gtk::ToggleButton::new();
         toggle_sidebar.add(&gtk::Image::from_icon_name(
@@ -1065,8 +1560,25 @@ fn main() -> glib::ExitCode {
             tr!("Mostrar barra lateral", "Show Sidebar"),
         );
         toggle_sidebar.set_active(true);
+        toggle_sidebar.style_context().add_class("sidebar-toggle");
         header.pack_start(&toggle_sidebar);
-        let new_tab = icon_button("list-add-symbolic", tr!("Nova aba", "New Tab"));
+        let new_tab = gtk::Button::new();
+        let new_tab_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        new_tab_row.pack_start(
+            &gtk::Image::from_icon_name(Some("list-add-symbolic"), gtk::IconSize::Button),
+            false,
+            false,
+            0,
+        );
+        new_tab_row.pack_start(
+            &gtk::Label::new(Some(tr!("Nova aba", "New Tab"))),
+            false,
+            false,
+            0,
+        );
+        new_tab.add(&new_tab_row);
+        label_control(&new_tab, tr!("Nova aba (Ctrl+T)", "New Tab (Ctrl+T)"));
+        new_tab.style_context().add_class("suggested-action");
         header.pack_end(&new_tab);
         let settings = icon_button("emblem-system-symbolic", tr!("Configurações", "Settings"));
         header.pack_end(&settings);
@@ -1085,17 +1597,27 @@ fn main() -> glib::ExitCode {
         let rail = gtk::Box::new(gtk::Orientation::Vertical, 8);
         rail.style_context().add_class("rail");
         let loader = gtk::gdk_pixbuf::PixbufLoader::new();
-        loader.set_size(38, 38);
+        loader.set_size(34, 34);
         let _ = loader.write(include_bytes!("../assets/alpha-file-manager.svg"));
         let _ = loader.close();
         let brand = gtk::Image::from_pixbuf(loader.pixbuf().as_ref());
         let sidebar_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar_column.style_context().add_class("glass-sidebar");
-        let brand_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let brand_row = gtk::Box::new(gtk::Orientation::Horizontal, 11);
         brand_row.style_context().add_class("brand-row");
-        brand_row.set_height_request(49);
-        brand_row.set_halign(gtk::Align::Center);
+        brand_row.set_height_request(BAR_HEIGHT);
         brand_row.pack_start(&brand, false, false, 0);
+        let wordmark = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        wordmark.set_valign(gtk::Align::Center);
+        let brand_name = gtk::Label::new(Some("Alpha"));
+        brand_name.set_xalign(0.0);
+        brand_name.style_context().add_class("brand-name");
+        let brand_product = gtk::Label::new(Some("FILE MANAGER"));
+        brand_product.set_xalign(0.0);
+        brand_product.style_context().add_class("brand-product");
+        wordmark.pack_start(&brand_name, false, false, 0);
+        wordmark.pack_start(&brand_product, false, false, 0);
+        brand_row.pack_start(&wordmark, false, false, 0);
         sidebar_column.pack_start(&brand_row, false, false, 0);
         let home = location_button("go-home-symbolic", tr!("Início", "Home"), true);
         let files = location_button("folder-symbolic", tr!("Arquivos", "Files"), true);
@@ -1103,7 +1625,7 @@ fn main() -> glib::ExitCode {
         rail.pack_start(&files, false, false, 0);
         let sidebar = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
         sidebar.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        sidebar.set_width_request(172);
+        sidebar.set_width_request(SIDEBAR_WIDTH);
         sidebar.add(&rail);
         sidebar_column.pack_start(&sidebar, true, true, 0);
         let sidebar_revealer = gtk::Revealer::new();
@@ -1141,6 +1663,7 @@ fn main() -> glib::ExitCode {
             transfer: transfer.clone(),
         };
         commands::install(&window, app, &header, &navigation, &toggle_sidebar);
+        header.set_custom_title(Some(&global_search(&window, app, &navigation)));
         add_sidebar_locations(&rail, &navigation);
         let dashboard = dashboard(&navigation);
         stack.add_named(&dashboard, "home");
@@ -1331,7 +1854,12 @@ fn location_button(icon: &str, name: &str, compact: bool) -> gtk::Button {
     } else {
         gtk::IconSize::LargeToolbar
     };
-    row.add(&gtk::Image::from_icon_name(Some(icon), size));
+    let image = if compact {
+        gtk::Image::from_icon_name(Some(&symbolic(icon)), size)
+    } else {
+        gtk::Image::from_icon_name(Some(icon), size)
+    };
+    row.add(&image);
     let label = gtk::Label::new(Some(name));
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.set_max_width_chars(if compact { 16 } else { 24 });
@@ -1350,7 +1878,11 @@ fn location(
     compact: bool,
     pinned: bool,
 ) -> gtk::Button {
-    let button = location_button(icon, name, compact);
+    let button = if compact {
+        location_button(icon, name, compact)
+    } else {
+        card_button(icon, name, &path, pinned)
+    };
     button.set_tooltip_text(Some(&path.to_string_lossy()));
     let target = path.clone();
     let open = navigation.clone();
@@ -1422,7 +1954,8 @@ fn pinned_locations(container: &impl IsA<gtk::Container>, navigation: &Navigatio
 }
 
 fn section(name: &str) -> gtk::Label {
-    let label = gtk::Label::new(Some(name));
+    // GTK3 CSS has no text-transform, so the uppercase style is applied here.
+    let label = gtk::Label::new(Some(&name.to_uppercase()));
     label.set_xalign(0.0);
     label.style_context().add_class("section-title");
     label
@@ -1448,13 +1981,15 @@ fn add_sidebar_locations(rail: &gtk::Box, navigation: &Navigation) {
     pinned_locations(&pins, navigation, true);
 }
 
-fn card_grid() -> gtk::FlowBox {
+/// `min == max == 2` makes a single card span half the width (two of four columns).
+fn card_grid(min: u32, max: u32) -> gtk::FlowBox {
     let cards = gtk::FlowBox::new();
     cards.set_selection_mode(gtk::SelectionMode::None);
     cards.set_homogeneous(true);
-    cards.set_max_children_per_line(4);
-    cards.set_row_spacing(10);
-    cards.set_column_spacing(10);
+    cards.set_min_children_per_line(min);
+    cards.set_max_children_per_line(max);
+    cards.set_row_spacing(12);
+    cards.set_column_spacing(12);
     cards
 }
 
@@ -1467,7 +2002,9 @@ fn dashboard(navigation: &Navigation) -> gtk::ScrolledWindow {
 
     let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     heading.pack_start(&section(tr!("Fixados", "Pinned")), true, true, 0);
-    let add = gtk::Button::with_label(tr!("Adicionar pasta", "Add Folder"));
+    let add = gtk::Button::with_label(tr!("+ Adicionar pasta", "+ Add Folder"));
+    add.style_context().add_class("link-action");
+    add.set_valign(gtk::Align::Center);
     heading.pack_end(&add, false, false, 0);
     content.pack_start(&heading, false, false, 0);
     add.connect_clicked(|button| {
@@ -1495,34 +2032,310 @@ fn dashboard(navigation: &Navigation) -> gtk::ScrolledWindow {
             }
         }
     });
-    let pinned = card_grid();
+    let pinned = card_grid(2, 2);
     pinned.set_no_show_all(true);
     content.pack_start(&pinned, false, false, 0);
     pinned_locations(&pinned, navigation, false);
 
-    for (heading, locations) in [
-        (
-            tr!("Pastas pessoais", "Personal Folders"),
-            standard_locations(),
-        ),
-        (
-            tr!("Sistema", "System"),
-            vec![(
-                tr!("Sistema de arquivos", "File System"),
-                "drive-harddisk",
-                PathBuf::from("/"),
-            )],
-        ),
-    ] {
-        content.pack_start(&section(heading), false, false, 0);
-        let cards = card_grid();
-        for (name, icon, path) in locations {
-            cards.add(&location(navigation, icon, name, path, false, false));
-        }
-        content.pack_start(&cards, false, false, 0);
+    content.pack_start(
+        &section(tr!("Pastas pessoais", "Personal Folders")),
+        false,
+        false,
+        0,
+    );
+    let cards = card_grid(2, 4);
+    for (name, icon, path) in standard_locations() {
+        cards.add(&location(navigation, icon, name, path, false, false));
     }
+    content.pack_start(&cards, false, false, 0);
+
+    content.pack_start(&section(tr!("Sistema", "System")), false, false, 0);
+    let system = card_grid(2, 2);
+    system.add(&disk_card(navigation));
+    content.pack_start(&system, false, false, 0);
     scroll.add(&content);
     scroll
+}
+
+/// Monochrome icon name, as in the mockup's line icons.
+fn symbolic(icon: &str) -> String {
+    let icon = match icon {
+        "folder-bookmark" => "folder",
+        other => other,
+    };
+    if icon.ends_with("-symbolic") {
+        icon.to_owned()
+    } else {
+        format!("{icon}-symbolic")
+    }
+}
+
+/// Colour of the icon chip on a home card.
+fn tint(icon: &str) -> &'static str {
+    match icon {
+        "user-home" | "folder-videos" | "folder-bookmark" => "tint-accent",
+        "user-desktop" | "folder-music" => "tint-cyan",
+        "folder-download" => "tint-amber",
+        "folder-documents" => "tint-violet",
+        "folder-pictures" => "tint-rose",
+        _ => "tint-neutral",
+    }
+}
+
+fn chip(icon: &str) -> gtk::Box {
+    let chip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    chip.style_context().add_class("chip");
+    chip.style_context().add_class(tint(icon));
+    chip.set_size_request(44, 44);
+    chip.set_valign(gtk::Align::Center);
+    let image = gtk::Image::from_icon_name(Some(&symbolic(icon)), gtk::IconSize::LargeToolbar);
+    image.set_pixel_size(22);
+    image.set_halign(gtk::Align::Center);
+    image.set_valign(gtk::Align::Center);
+    chip.pack_start(&image, true, true, 0);
+    chip
+}
+
+/// `~/Downloads` instead of `/home/user/Downloads`.
+fn display_path(path: &Path) -> String {
+    let home = glib::home_dir();
+    match path.strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// 1204 -> "1.204" (pt) or "1,204" (en).
+fn group_digits(value: usize) -> String {
+    let separator = if i18n::portuguese() { '.' } else { ',' };
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (position, digit) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            grouped.push(separator);
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// Counts visible entries on a worker thread, then appends the count to `label`.
+fn count_entries_async(path: PathBuf, label: &gtk::Label) {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let count = fs::read_dir(&path).ok().map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+                .count()
+        });
+        let _ = sender.send(count);
+    });
+    let label = label.downgrade();
+    glib::timeout_add_local(Duration::from_millis(40), move || {
+        match receiver.try_recv() {
+            Err(TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) | Ok(None) => {}
+            Ok(Some(count)) => {
+                if let Some(label) = label.upgrade() {
+                    let place = label.text();
+                    label.set_text(&if count == 1 {
+                        trf!("{} · 1 item", "{} · 1 item", place)
+                    } else {
+                        trf!("{} · {} itens", "{} · {} items", place, group_digits(count))
+                    });
+                }
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn card_text(title: &str) -> (gtk::Box, gtk::Label) {
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    text.set_valign(gtk::Align::Center);
+    let heading = gtk::Label::new(Some(title));
+    heading.set_xalign(0.0);
+    heading.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    heading.style_context().add_class("card-title");
+    text.pack_start(&heading, false, false, 0);
+    (text, heading)
+}
+
+/// Home card: coloured icon chip, title, path and item count, chevron.
+fn card_button(icon: &str, name: &str, path: &Path, pinned: bool) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.style_context().add_class("card");
+    if pinned {
+        button.style_context().add_class("pinned-card");
+    }
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    row.pack_start(&chip(icon), false, false, 0);
+    let (text, _) = card_text(name);
+    let detail = gtk::Label::new(Some(&display_path(path)));
+    detail.set_xalign(0.0);
+    detail.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    detail.style_context().add_class("card-detail");
+    text.pack_start(&detail, false, false, 0);
+    row.pack_start(&text, true, true, 0);
+    if pinned {
+        let badge = gtk::Label::new(Some(&tr!("Fixado", "Pinned").to_uppercase()));
+        badge.style_context().add_class("pin-badge");
+        badge.set_valign(gtk::Align::Start);
+        row.pack_start(&badge, false, false, 0);
+    }
+    let chevron = gtk::Image::from_icon_name(Some("go-next-symbolic"), gtk::IconSize::Button);
+    chevron.style_context().add_class("chevron");
+    chevron.set_valign(gtk::Align::Center);
+    row.pack_start(&chevron, false, false, 0);
+    button.add(&row);
+    label_control(&button, name);
+    count_entries_async(path.to_owned(), &detail);
+    button
+}
+
+/// System card: free space and a usage bar for the root file system.
+fn disk_card(navigation: &Navigation) -> gtk::Button {
+    let root = PathBuf::from("/");
+    let button = gtk::Button::new();
+    button.style_context().add_class("card");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    row.pack_start(&chip("drive-harddisk"), false, false, 0);
+    let name = tr!("Sistema de arquivos", "File System");
+    let (text, _) = card_text(name);
+    let (size, free) = gio::File::for_path(&root)
+        .query_filesystem_info("filesystem::size,filesystem::free", gio::Cancellable::NONE)
+        .map(|info| {
+            (
+                info.attribute_uint64("filesystem::size"),
+                info.attribute_uint64("filesystem::free"),
+            )
+        })
+        .unwrap_or_default();
+    if size > 0 {
+        // Title and free space share the first line, as in the mockup.
+        let first = text.children().into_iter().next();
+        if let Some(heading) = first {
+            text.remove(&heading);
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            line.pack_start(&heading, true, true, 0);
+            let space = gtk::Label::new(Some(&trf!(
+                "{} livres de {}",
+                "{} free of {}",
+                format_size(free),
+                format_size(size)
+            )));
+            space.style_context().add_class("card-detail");
+            line.pack_end(&space, false, false, 0);
+            text.pack_start(&line, false, false, 0);
+        }
+        let usage = gtk::ProgressBar::new();
+        usage.style_context().add_class("usage");
+        usage.set_fraction(size.saturating_sub(free) as f64 / size as f64);
+        usage.set_valign(gtk::Align::Center);
+        text.pack_start(&usage, false, false, 4);
+    }
+    row.pack_start(&text, true, true, 0);
+    button.add(&row);
+    label_control(&button, name);
+    button.set_tooltip_text(Some("/"));
+    let open = navigation.clone();
+    button.connect_clicked(move |_| open.open(&root));
+    button
+}
+
+/// Header search. A path (`/…` or `~/…`) opens that folder; a file path opens its folder
+/// filtered to it; anything else filters the current folder. Ctrl+K focuses it.
+fn global_search(
+    window: &gtk::ApplicationWindow,
+    app: &gtk::Application,
+    navigation: &Navigation,
+) -> gtk::Overlay {
+    let entry = gtk::Entry::new();
+    entry.style_context().add_class("global-search");
+    entry.set_placeholder_text(Some(tr!(
+        "Buscar ou digitar um caminho…",
+        "Search or type a path…"
+    )));
+    entry.set_primary_icon_name(Some("system-search-symbolic"));
+    // Narrow windows shrink the pill so menus, search and actions all fit.
+    entry.set_width_chars(22);
+    entry.set_max_width_chars(46);
+    label_control(
+        &entry,
+        tr!("Buscar ou ir para um caminho", "Search or go to a path"),
+    );
+    let hint = gtk::Label::new(Some("Ctrl K"));
+    hint.style_context().add_class("kbd");
+    hint.set_halign(gtk::Align::End);
+    hint.set_valign(gtk::Align::Center);
+    hint.set_margin_end(9);
+    let overlay = gtk::Overlay::new();
+    overlay.add(&entry);
+    overlay.add_overlay(&hint);
+    overlay.set_overlay_pass_through(&hint, true);
+    overlay.set_valign(gtk::Align::Center);
+    let hint_control = hint.downgrade();
+    entry.connect_changed(move |entry| {
+        if let Some(hint) = hint_control.upgrade() {
+            hint.set_opacity(if entry.text().is_empty() { 1.0 } else { 0.0 });
+        }
+    });
+
+    let owner = window.downgrade();
+    let navigation = navigation.clone();
+    entry.connect_activate(move |entry| {
+        let text = entry.text().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        let (Some(window), Some(stack), Some(tabs)) = (
+            owner.upgrade(),
+            navigation.stack.upgrade(),
+            navigation.tabs.upgrade(),
+        ) else {
+            return;
+        };
+        let path = match text.as_str() {
+            "~" => Some(glib::home_dir()),
+            text if text.starts_with("~/") => Some(glib::home_dir().join(&text[2..])),
+            text if text.starts_with('/') => Some(PathBuf::from(text)),
+            _ => None,
+        };
+        if tabs.n_pages() == 0 {
+            open_tab(&tabs, &glib::home_dir(), navigation.transfer.clone());
+        }
+        stack.set_visible_child_name("files");
+        let Some(browser) = commands::active(&window, &tabs) else {
+            return;
+        };
+        match path {
+            Some(path) if path.is_dir() => {
+                browser.navigate(&path, true);
+            }
+            Some(path) => {
+                if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                    if browser.navigate(parent, true) {
+                        browser.filter.set_text(&name.to_string_lossy());
+                    }
+                }
+            }
+            None => browser.filter.set_text(&text),
+        }
+        entry.set_text("");
+    });
+
+    let focus = gio::SimpleAction::new("focus-search", None);
+    let target = entry.downgrade();
+    focus.connect_activate(move |_, _| {
+        if let Some(entry) = target.upgrade() {
+            entry.grab_focus();
+        }
+    });
+    window.add_action(&focus);
+    app.set_accels_for_action("win.focus-search", &["<Primary>k"]);
+    overlay
 }
 
 fn show_error(widget: &impl IsA<gtk::Widget>, message: &str) {
@@ -1613,5 +2426,97 @@ fn image_thumbnail(path: &Path) -> Option<gtk::gdk_pixbuf::Pixbuf> {
     if width <= 0 || height <= 0 || i64::from(width) * i64::from(height) > 20_000_000 {
         return None;
     }
-    gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, 32, 32, true).ok()
+    gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, THUMBNAIL, THUMBNAIL, true).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn scratch(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|time| time.as_nanos())
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("alpha-fm-{name}-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn names(rows: &[Entry]) -> Vec<&str> {
+        rows.iter().map(|entry| entry.name.as_str()).collect()
+    }
+
+    #[test]
+    fn folders_come_first_and_names_sort_case_insensitively() {
+        let dir = scratch("order");
+        fs::write(dir.join("beta.txt"), b"b").unwrap();
+        fs::write(dir.join("Alpha.txt"), b"a").unwrap();
+        fs::create_dir(dir.join("zeta")).unwrap();
+        let (mut rows, unreadable) = scan(&dir).unwrap();
+        assert_eq!(unreadable, 0);
+        sort_rows(&mut rows, 1, false);
+        assert_eq!(names(&rows), ["zeta", "Alpha.txt", "beta.txt"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn size_sort_descending_keeps_folders_first() {
+        let dir = scratch("size");
+        fs::write(dir.join("small"), vec![0u8; 10]).unwrap();
+        fs::write(dir.join("large"), vec![0u8; 5000]).unwrap();
+        fs::create_dir(dir.join("folder")).unwrap();
+        let (mut rows, _) = scan(&dir).unwrap();
+        sort_rows(&mut rows, 3, true);
+        assert_eq!(names(&rows), ["folder", "large", "small"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hidden_entries_are_flagged_not_dropped() {
+        let dir = scratch("hidden");
+        fs::write(dir.join(".secret"), b"x").unwrap();
+        fs::write(dir.join("visible"), b"x").unwrap();
+        let (rows, _) = scan(&dir).unwrap();
+        let hidden: Vec<bool> = rows.iter().map(|entry| entry.hidden).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(hidden.iter().filter(|flag| **flag).count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn card_paths_are_shortened_under_home() {
+        let home = glib::home_dir();
+        assert_eq!(display_path(&home), "~");
+        assert_eq!(display_path(&home.join("Downloads")), "~/Downloads");
+        assert_eq!(display_path(Path::new("/etc")), "/etc");
+    }
+
+    #[test]
+    fn missing_folder_reports_an_error() {
+        assert!(scan(Path::new("/definitely/not/a/real/folder")).is_err());
+    }
+
+    /// Performance guard: a 10k-entry folder must scan and sort well within budget.
+    /// The budget is deliberately loose so slow CI machines do not flake; a real
+    /// regression (for example, going back to quadratic behaviour) blows far past it.
+    #[test]
+    fn large_folder_scans_and_sorts_within_budget() {
+        let dir = scratch("perf");
+        for index in 0..10_000 {
+            fs::write(dir.join(format!("file_{index:05}.txt")), b"x").unwrap();
+        }
+        let started = Instant::now();
+        let (mut rows, _) = scan(&dir).unwrap();
+        sort_rows(&mut rows, 1, false);
+        let elapsed = started.elapsed();
+        assert_eq!(rows.len(), 10_000);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "scan+sort of 10k entries took {elapsed:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

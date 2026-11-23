@@ -1,49 +1,155 @@
+/* Alpha File Manager visual layer.
+   Tokens come from preferences::apply_theme: @phosphor (accent),
+   @phosphor_selection and @phosphor_bg. */
+
 .alpha {
+    /* Inter when installed, otherwise the system sans-serif. */
+    font-family: "Inter", sans-serif;
     background-color: @phosphor_bg;
-    background-image: linear-gradient(147deg, shade(@phosphor_selection, 0.83), @phosphor_bg 44%, shade(@phosphor_bg, 0.72));
-    color: #edf5f0;
-}
-.alpha headerbar {
-    background-image: none;
-    background-color: alpha(#171f22, 0.89);
-    color: #edf5f0;
-    border-bottom: 1px solid #2d3b3e;
-    box-shadow: none;
+    background-image: linear-gradient(160deg, shade(@phosphor_selection, 0.78), @phosphor_bg 48%, shade(@phosphor_bg, 0.8));
+    color: #eef6f1;
 }
 .alpha viewport { background-color: transparent; }
+
+/* ---------- Header ---------- */
+.alpha headerbar {
+    background-image: linear-gradient(180deg, alpha(#1b2a2d, 0.96), alpha(#131d20, 0.94));
+    color: #eef6f1;
+    border-bottom: 1px solid alpha(white, 0.07);
+    box-shadow: inset 0 -1px alpha(@phosphor, 0.08);
+    min-height: 58px;
+    padding: 0 14px 0 10px;
+}
+.alpha headerbar .title {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    color: #f2f8f4;
+}
+.alpha headerbar button {
+    background-color: transparent;
+    background-image: none;
+    border-color: transparent;
+    box-shadow: none;
+    min-width: 32px;
+    min-height: 32px;
+    color: #c9d8d0;
+}
+.alpha headerbar button:hover { background-color: alpha(white, 0.07); color: #ffffff; }
+.alpha headerbar button:active { background-color: alpha(black, 0.25); }
+.alpha headerbar button:checked {
+    background-color: alpha(@phosphor, 0.16);
+    color: @phosphor;
+}
+.alpha headerbar button.suggested-action {
+    background-image: linear-gradient(180deg, shade(@phosphor, 1.12), @phosphor);
+    color: #06180f;
+    border: 1px solid alpha(black, 0.18);
+    font-weight: 700;
+    box-shadow: inset 0 1px alpha(white, 0.45), 0 4px 14px alpha(@phosphor, 0.22);
+}
+.alpha headerbar button.suggested-action:hover { background-image: linear-gradient(180deg, shade(@phosphor, 1.2), shade(@phosphor, 1.06)); }
+
+.alpha .glass-toolbar { min-height: 58px; }
+
+/* ---------- Sidebar ---------- */
 .alpha .glass-sidebar {
-    background-color: alpha(#172022, 0.87);
-    border-right: 1px solid alpha(white, 0.11);
+    background-image: linear-gradient(180deg, alpha(#162124, 0.94), alpha(#0f1719, 0.97));
+    border-right: 1px solid alpha(white, 0.06);
 }
-.alpha .rail { padding: 8px; background-color: transparent; }
-.alpha .brand-row { border-bottom: 1px solid alpha(white, 0.08); }
-.alpha .glass-toolbar {
-    min-height: 48px;
-    padding: 0 12px;
-    border-radius: 0;
-    border-bottom-color: alpha(white, 0.10);
+.alpha .rail { padding: 10px 8px; background-color: transparent; }
+.alpha .brand-row { border-bottom: 1px solid alpha(white, 0.06); }
+.alpha .section-title {
+    color: #6f877d;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.1px;
+    margin: 10px 8px 4px 8px;
 }
+.alpha .subheading { color: #9fb3a9; font-size: 13px; }
+.alpha .muted { color: #8ea59b; padding: 2px 4px; font-size: 12px; }
+
+.alpha button.location,
+.alpha button.side-location {
+    background-color: transparent;
+    background-image: none;
+    border-color: transparent;
+    box-shadow: none;
+    border-radius: 11px;
+    color: #c7d5cd;
+    transition: background-color 140ms ease-out, color 140ms ease-out;
+}
+.alpha button.location { padding: 8px 10px; min-height: 36px; }
+.alpha button.side-location { min-width: 32px; min-height: 30px; }
+.alpha button.location:hover,
+.alpha button.side-location:hover { background-color: alpha(white, 0.05); color: #effff6; }
+.alpha button.location:active { background-color: alpha(black, 0.2); }
+.alpha .rail button.current {
+    background-image: linear-gradient(90deg, alpha(@phosphor, 0.20), alpha(@phosphor, 0.03));
+    border-color: transparent;
+    color: #effff6;
+    box-shadow: inset 3px 0 0 @phosphor;
+}
+
+/* ---------- Home ---------- */
 .alpha .hero {
     background-image: linear-gradient(118deg, @phosphor_selection, @phosphor_bg);
     border-radius: 18px;
-    box-shadow: 0 8px 22px alpha(black, 0.28);
+    box-shadow: 0 14px 34px alpha(black, 0.32), inset 0 0 0 1px alpha(white, 0.06);
 }
-.alpha .home-title { font-size: 32px; font-weight: bold; }
-.alpha .section-title { color: #b1c6bc; font-weight: bold; }
-.alpha .muted { color: #b1c6bc; padding: 4px; }
+.alpha .home-title {
+    color: #ffffff;
+    font-size: 30px;
+    font-weight: 800;
+    letter-spacing: -0.4px;
+    text-shadow: 0 2px 10px black;
+}
+.alpha button.banner-control {
+    background-color: alpha(#0b1417, 0.6);
+    border-color: alpha(white, 0.2);
+    border-radius: 12px;
+    min-width: 34px;
+    min-height: 34px;
+}
+.alpha button.banner-control:hover { background-color: alpha(#0b1417, 0.85); }
+
+/* ---------- Buttons: three levels ---------- */
 .alpha button {
     background-image: none;
-    background-color: #202b2e;
-    color: #edf5f0;
-    border: 1px solid #354449;
-    border-radius: 8px;
-    box-shadow: none;
+    background-color: alpha(white, 0.045);
+    color: #dfeae4;
+    border: 1px solid alpha(white, 0.08);
+    border-radius: 10px;
+    box-shadow: inset 0 1px alpha(white, 0.04);
     text-shadow: none;
+    transition: background-color 140ms ease-out, border-color 140ms ease-out;
 }
-.alpha button:hover { background-color: #2d4042; }
-.alpha button:checked { background-color: @phosphor_selection; color: #effff6; }
-.alpha button:focus, .alpha entry:focus { border-color: @phosphor; }
-.alpha button.location { padding: 14px 12px; min-height: 28px; }
+.alpha button:hover {
+    background-color: alpha(white, 0.09);
+    border-color: alpha(white, 0.14);
+}
+.alpha button:active { background-color: alpha(black, 0.22); box-shadow: inset 0 1px 3px alpha(black, 0.3); }
+.alpha button:checked {
+    background-color: alpha(@phosphor, 0.16);
+    border-color: alpha(@phosphor, 0.36);
+    color: @phosphor;
+}
+.alpha button:disabled { color: alpha(#dfeae4, 0.35); background-color: alpha(white, 0.02); }
+.alpha button.suggested-action {
+    background-image: linear-gradient(180deg, shade(@phosphor, 1.12), @phosphor);
+    color: #06180f;
+    border-color: alpha(black, 0.18);
+    font-weight: 700;
+    box-shadow: inset 0 1px alpha(white, 0.45), 0 4px 14px alpha(@phosphor, 0.2);
+}
+.alpha button.suggested-action:hover { background-image: linear-gradient(180deg, shade(@phosphor, 1.2), shade(@phosphor, 1.06)); }
+
+/* Segmented control (list / icons) */
+.alpha box.linked { background-color: alpha(white, 0.04); border-radius: 11px; padding: 2px; border: 1px solid alpha(white, 0.07); }
+.alpha box.linked > button { border-color: transparent; background-color: transparent; border-radius: 9px; box-shadow: none; }
+.alpha box.linked > button:checked { background-color: alpha(@phosphor, 0.2); box-shadow: inset 0 0 0 1px alpha(@phosphor, 0.3); }
+
+.alpha button.location { padding: 8px 10px; }
 .alpha button.tab-close {
     background-color: transparent;
     border-color: transparent;
@@ -51,54 +157,222 @@
     min-height: 20px;
     padding: 0;
 }
-.alpha button.tab-close:hover { background-color: #3d4c4e; }
+.alpha button.tab-close:hover { background-color: alpha(white, 0.1); }
+
+/* ---------- Inputs ---------- */
 .alpha entry {
-    background-color: #1a2528;
+    background-color: alpha(#0b1416, 0.72);
     color: #edf5f0;
-    border: 1px solid #354449;
-    border-radius: 8px;
-    box-shadow: none;
+    border: 1px solid alpha(white, 0.08);
+    border-radius: 12px;
+    min-height: 32px;
+    box-shadow: inset 0 1px 2px alpha(black, 0.25);
+    transition: border-color 140ms ease-out, box-shadow 140ms ease-out;
+}
+.alpha entry:focus {
+    border-color: alpha(@phosphor, 0.6);
+    box-shadow: 0 0 0 3px alpha(@phosphor, 0.14);
 }
 .alpha entry selection { background-color: @phosphor_selection; color: #ffffff; }
-.alpha notebook > header { background-color: #171f22; border-color: #2d3b3e; }
-.alpha notebook > header tab { color: #b1c6bc; padding: 5px 10px; }
-.alpha notebook > header tab:checked { background-color: #202d30; color: #edf5f0; box-shadow: inset 0 -2px @phosphor; }
-.alpha .tab-actions { border-bottom: 1px solid #253336; }
-.alpha .file-surface { border: 1px solid #354449; }
-.alpha treeview.view { background-color: #192326; color: #edf5f0; }
-.alpha treeview.view:selected { background-color: @phosphor_selection; color: #ffffff; }
-.alpha treeview.view header button { border-radius: 0; }
-.alpha paned > separator { background-color: #354449; }
-.alpha .rail button.current {
-    background-color: @phosphor_selection;
-    border-color: #5b8976;
-    color: #b8f6db;
-}
 
+/* ---------- Tabs ---------- */
+.alpha notebook > header { background-color: transparent; border: none; }
+.alpha notebook > header tab { color: #9fb3a9; padding: 6px 12px; border-radius: 10px 10px 0 0; }
+.alpha notebook > header tab:checked { background-color: alpha(white, 0.05); color: #edf5f0; box-shadow: inset 0 -2px @phosphor; }
+.alpha .tab-actions { border-bottom: 1px solid alpha(white, 0.06); padding-bottom: 4px; }
 
-.alpha .side-location { min-width: 32px; min-height: 30px; }
-.alpha .subheading { color: #b9c8c1; font-size: 14px; }
-menu.alpha { background-color: #1a2528; color: #edf5f0; }
-menu.alpha menuitem:hover { background-color: @phosphor_selection; }
-
-.alpha .home-title {
-    color: #ffffff;
-    font-weight: 700;
-    text-shadow: 0 2px 8px black;
-}
-.alpha button.banner-control {
-    background-color: alpha(#111c20, 0.78);
-    border-color: alpha(white, 0.34);
+/* ---------- File surfaces ---------- */
+.alpha .file-surface {
+    background-color: alpha(#0d1618, 0.62);
+    border: 1px solid alpha(white, 0.06);
     border-radius: 16px;
-    min-width: 34px;
-    min-height: 32px;
 }
-.alpha button.location {
-    background-color: alpha(#233034, 0.76);
-    border-color: alpha(white, 0.13);
+.alpha treeview.view { background-color: transparent; color: #edf5f0; }
+.alpha treeview.view:selected { background-color: alpha(@phosphor, 0.22); color: #ffffff; }
+.alpha treeview.view header button {
+    background-color: transparent;
+    border: none;
+    border-bottom: 1px solid alpha(white, 0.06);
+    border-radius: 0;
+    box-shadow: none;
+    color: #8ea59b;
+    font-size: 12px;
+    font-weight: 600;
+    min-height: 30px;
+}
+.alpha treeview.view header button:hover { color: #edf5f0; background-color: alpha(white, 0.03); }
+
+.alpha iconview.view { background-color: transparent; color: #edf5f0; }
+.alpha iconview.view:selected {
+    background-color: alpha(@phosphor, 0.22);
+    color: #ffffff;
+    border-radius: 14px;
+}
+
+.alpha paned > separator { background-color: alpha(white, 0.06); }
+
+/* ---------- Menus ---------- */
+menu.alpha {
+    background-color: #172326;
+    color: #edf5f0;
+    border: 1px solid alpha(white, 0.1);
     border-radius: 12px;
+    padding: 6px;
+    box-shadow: 0 16px 36px alpha(black, 0.4);
 }
-.alpha button.location:hover { background-color: #324346; }
+menu.alpha menuitem { border-radius: 8px; padding: 6px 10px; }
+menu.alpha menuitem:hover { background-color: alpha(@phosphor, 0.22); }
+
+/* ---------- Translucent option ---------- */
 .alpha.translucent .glass-sidebar,
 .alpha.translucent headerbar.glass-toolbar { background-color: alpha(#152023, 0.63); }
 .alpha.translucent button.location { background-color: alpha(#263539, 0.58); }
+
+/* ================= Mockup fidelity ================= */
+
+/* Brand block, aligned with the header */
+.alpha .brand-row {
+    padding: 0 18px;
+    border-bottom: 1px solid alpha(white, 0.07);
+    background-image: linear-gradient(180deg, alpha(#1b2a2d, 0.96), alpha(#131d20, 0.94));
+}
+.alpha .brand-name { font-size: 15px; font-weight: 800; color: #f2f8f4; }
+.alpha .brand-product { font-size: 10px; font-weight: 600; letter-spacing: 1.4px; color: #8fa39b; }
+
+/* Search pill in the header */
+.alpha entry.global-search {
+    min-height: 38px;
+    border-radius: 20px;
+    padding: 0 64px 0 12px;
+    background-color: alpha(white, 0.045);
+    border: 1px solid alpha(white, 0.08);
+    box-shadow: none;
+    color: #eef6f1;
+}
+.alpha entry.global-search image { color: #8fa39b; margin-right: 6px; }
+.alpha entry.global-search:focus {
+    border-color: alpha(@phosphor, 0.55);
+    box-shadow: 0 0 0 3px alpha(@phosphor, 0.12);
+}
+.alpha .kbd {
+    font-size: 11px;
+    font-weight: 600;
+    color: #8fa39b;
+    padding: 3px 7px;
+    border-radius: 7px;
+    background-color: alpha(white, 0.06);
+    border: 1px solid alpha(white, 0.08);
+}
+
+/* Sidebar toggle is a visibility switch: no accent fill when on */
+.alpha headerbar button.sidebar-toggle,
+.alpha headerbar button.sidebar-toggle:checked {
+    background-color: transparent;
+    border-color: transparent;
+    box-shadow: none;
+    color: #c9d8d0;
+}
+.alpha headerbar button.sidebar-toggle:checked:hover { background-color: alpha(white, 0.07); }
+.alpha headerbar button.suggested-action { padding: 0 14px 0 12px; min-height: 36px; border-radius: 11px; }
+.alpha headerbar button.suggested-action label { color: #06180f; font-weight: 700; }
+.alpha headerbar button.suggested-action image { color: #06180f; }
+
+/* Sidebar rows */
+.alpha .rail { padding: 6px 10px 12px 10px; }
+.alpha button.side-location { min-height: 38px; padding: 0 10px; }
+.alpha button.side-location label { font-size: 14px; }
+.alpha button.side-location image { color: #9bb3a8; }
+.alpha .rail button.current image { color: @phosphor; }
+.alpha .rail .section-title { margin: 16px 10px 6px 10px; }
+
+/* Home sections */
+.alpha .section-title { font-size: 12px; color: #9fb5aa; letter-spacing: 1.2px; }
+.alpha button.link-action {
+    background-color: transparent;
+    border-color: transparent;
+    box-shadow: none;
+    color: @phosphor;
+    font-weight: 600;
+    padding: 2px 6px;
+}
+.alpha button.link-action:hover { background-color: alpha(@phosphor, 0.08); }
+.alpha flowboxchild { padding: 0; background-color: transparent; }
+
+/* Cards */
+.alpha button.card {
+    padding: 14px;
+    border-radius: 16px;
+    background-color: transparent;
+    background-image: linear-gradient(180deg, alpha(white, 0.035), alpha(white, 0.015));
+    border: 1px solid alpha(white, 0.07);
+    box-shadow: none;
+    color: #eef6f1;
+}
+.alpha button.card:hover {
+    background-image: linear-gradient(180deg, alpha(white, 0.06), alpha(white, 0.03));
+    border-color: alpha(white, 0.13);
+}
+.alpha button.card.pinned-card {
+    background-image: linear-gradient(120deg, alpha(@phosphor, 0.14), alpha(@phosphor, 0.02) 60%);
+    background-color: alpha(#142225, 0.9);
+    border-color: alpha(@phosphor, 0.24);
+}
+.alpha .card-title { font-size: 14.5px; font-weight: 700; color: #eef6f1; }
+.alpha .card-detail { font-size: 12.5px; color: #8fa39b; }
+.alpha .chevron { color: #5d736a; }
+.alpha .pin-badge { font-size: 10.5px; font-weight: 700; letter-spacing: 0.5px; color: @phosphor; }
+
+/* Icon chips */
+.alpha .chip { border-radius: 14px; }
+.alpha .tint-accent { background-color: alpha(@phosphor, 0.13); color: @phosphor; }
+.alpha .pinned-card .tint-accent { background-image: linear-gradient(135deg, alpha(@phosphor, 0.28), alpha(@phosphor, 0.08)); }
+.alpha .tint-cyan { background-color: alpha(#80edff, 0.12); color: #80edff; }
+.alpha .tint-amber { background-color: alpha(#ffc77a, 0.12); color: #ffc77a; }
+.alpha .tint-violet { background-color: alpha(#d6baff, 0.12); color: #d6baff; }
+.alpha .tint-rose { background-color: alpha(#ff9eb5, 0.12); color: #ff9eb5; }
+.alpha .tint-neutral { background-color: alpha(white, 0.06); color: #cfe0d7; }
+
+/* Disk usage bar */
+.alpha progressbar.usage trough {
+    min-height: 6px;
+    border-radius: 99px;
+    background-color: alpha(white, 0.08);
+    border: none;
+    box-shadow: none;
+}
+.alpha progressbar.usage progress {
+    min-height: 6px;
+    border-radius: 99px;
+    background-image: linear-gradient(90deg, shade(@phosphor_selection, 1.4), @phosphor);
+    border: none;
+    box-shadow: none;
+}
+
+/* Menu bar as quiet text tabs in the header */
+.alpha headerbar button.menu-tab {
+    min-height: 32px;
+    min-width: 0;
+    padding: 0 10px;
+    border-radius: 9px;
+    color: #a9bdb3;
+    font-size: 13.5px;
+    font-weight: 500;
+}
+.alpha headerbar button.menu-tab:hover { background-color: alpha(white, 0.06); color: #f2f8f4; }
+.alpha headerbar button.menu-tab:checked {
+    background-color: alpha(@phosphor, 0.14);
+    border-color: transparent;
+    color: @phosphor;
+}
+.alpha headerbar button.sidebar-toggle { margin-right: 6px; }
+
+/* Menu popovers */
+.alpha popover, popover.background {
+    background-color: #172326;
+    border: 1px solid alpha(white, 0.1);
+    border-radius: 12px;
+    box-shadow: 0 16px 36px alpha(black, 0.4);
+}
+.alpha popover modelbutton { border-radius: 8px; padding: 6px 10px; color: #edf5f0; }
+.alpha popover modelbutton:hover { background-color: alpha(@phosphor, 0.18); }
+.alpha popover accelerator { color: #8fa39b; }
