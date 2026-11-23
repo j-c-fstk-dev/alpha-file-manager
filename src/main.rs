@@ -217,6 +217,7 @@ impl Browser {
         let forward = icon_button("go-next-symbolic", tr!("Avançar", "Forward"));
         let up = icon_button("go-up-symbolic", tr!("Pasta superior", "Parent Folder"));
         let address = gtk::Entry::new();
+        address.set_width_chars(8);
         toolbar.pack_start(&back, false, false, 0);
         toolbar.pack_start(&forward, false, false, 0);
         toolbar.pack_start(&up, false, false, 0);
@@ -226,6 +227,7 @@ impl Browser {
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         let filter = gtk::SearchEntry::new();
         filter.set_placeholder_text(Some(tr!("Filtrar nesta pasta", "Filter this Folder")));
+        filter.set_width_chars(8);
         let hidden = gtk::ToggleButton::new();
         hidden.add(&gtk::Image::from_icon_name(
             Some("view-reveal-symbolic"),
@@ -270,8 +272,10 @@ impl Browser {
         modes.pack_start(&list_mode, false, false, 0);
         modes.pack_start(&icon_mode, false, false, 0);
         actions.pack_start(&filter, true, true, 0);
-        actions.pack_start(&sort_combo, false, false, 0);
-        actions.pack_start(&modes, false, false, 0);
+        // Sort and view controls sit next to the address bar, which can shrink, so the
+        // action row keeps its original width and split view still fits on screen.
+        toolbar.pack_start(&sort_combo, false, false, 0);
+        toolbar.pack_start(&modes, false, false, 0);
         for button in [
             hidden.upcast_ref(),
             &create,
@@ -781,6 +785,7 @@ impl Browser {
                 show_context_menu(&state, event);
                 glib::Propagation::Stop
             });
+        install_drag_and_drop(&browser);
         (browser, root)
     }
 
@@ -1394,6 +1399,415 @@ fn show_context_menu(state: &Rc<Browser>, event: &gdk::EventButton) {
         });
     }
     show_menu(&menu, event);
+}
+
+thread_local! {
+    /// Paths being dragged from any pane of this process; empty for drags from other apps.
+    static DRAGGING: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+const URI_LIST: u32 = 0;
+const PLAIN_TEXT: u32 = 1;
+
+fn drag_actions() -> gdk::DragAction {
+    gdk::DragAction::COPY | gdk::DragAction::MOVE
+}
+
+/// Copy or move, the way common file managers do it: Ctrl copies, Shift moves,
+/// otherwise move on the same file system and copy across file systems.
+/// GTK already narrows `offered` to COPY or MOVE when Ctrl or Shift is held.
+fn drop_action(
+    offered: gdk::DragAction,
+    sources: &[PathBuf],
+    destination: &Path,
+) -> gdk::DragAction {
+    use std::os::unix::fs::MetadataExt;
+    let copy = offered.contains(gdk::DragAction::COPY);
+    let moving = offered.contains(gdk::DragAction::MOVE);
+    if copy && moving {
+        let same_device = sources
+            .first()
+            .and_then(|source| fs::symlink_metadata(source).ok())
+            .zip(fs::metadata(destination).ok())
+            .is_some_and(|(source, destination)| source.dev() == destination.dev());
+        if same_device {
+            gdk::DragAction::MOVE
+        } else {
+            gdk::DragAction::COPY
+        }
+    } else if moving {
+        gdk::DragAction::MOVE
+    } else if copy {
+        gdk::DragAction::COPY
+    } else {
+        gdk::DragAction::empty()
+    }
+}
+
+/// Sources that would actually change: not already in `destination`, and not
+/// `destination` itself or one of its parents.
+fn movable(sources: &[PathBuf], destination: &Path) -> Vec<PathBuf> {
+    sources
+        .iter()
+        .filter(|source| source.parent() != Some(destination))
+        .filter(|source| !destination.starts_with(source))
+        .cloned()
+        .collect()
+}
+
+impl Browser {
+    /// Folder a drop at widget coordinates (x, y) lands in, and the row to highlight:
+    /// a folder under the pointer, otherwise the folder this pane shows.
+    fn drop_destination(&self, x: i32, y: i32) -> (PathBuf, Option<gtk::TreePath>) {
+        let row = match self.mode() {
+            ViewMode::List => self.view.dest_row_at_pos(x, y).and_then(|(row, position)| {
+                row.filter(|_| {
+                    matches!(
+                        position,
+                        gtk::TreeViewDropPosition::IntoOrBefore
+                            | gtk::TreeViewDropPosition::IntoOrAfter
+                    )
+                })
+            }),
+            ViewMode::Icons => self
+                .icons
+                .dest_item_at_pos(x, y)
+                .filter(|(_, position)| *position == gtk::IconViewDropPosition::DropInto)
+                .map(|(row, _)| row),
+        };
+        if let Some(row) = row {
+            if let Some(path) = self.path_at(&row).filter(|path| path.is_dir()) {
+                return (path, Some(row));
+            }
+        }
+        (self.folder.borrow().clone(), None)
+    }
+
+    fn highlight_drop(&self, row: Option<&gtk::TreePath>) {
+        match self.mode() {
+            ViewMode::List => self
+                .view
+                .set_drag_dest_row(row, gtk::TreeViewDropPosition::IntoOrAfter),
+            ViewMode::Icons => self
+                .icons
+                .set_drag_dest_item(row, gtk::IconViewDropPosition::DropInto),
+        }
+    }
+
+    /// Scrolls while a drag hovers near the top or bottom edge.
+    fn autoscroll(&self, widget: &gtk::Widget, y: i32) {
+        let adjustment = match self.mode() {
+            ViewMode::List => gtk::prelude::ScrollableExt::vadjustment(&self.view),
+            ViewMode::Icons => gtk::prelude::ScrollableExt::vadjustment(&self.icons),
+        };
+        let Some(adjustment) = adjustment else {
+            return;
+        };
+        let height = widget.allocated_height();
+        let step = if y < 36 {
+            -24.0
+        } else if y > height - 36 {
+            24.0
+        } else {
+            return;
+        };
+        adjustment.set_value((adjustment.value() + step).clamp(
+            adjustment.lower(),
+            adjustment.upper() - adjustment.page_size(),
+        ));
+    }
+
+    fn receive_drop(
+        self: &Rc<Self>,
+        sources: Vec<PathBuf>,
+        destination: &Path,
+        action: gdk::DragAction,
+    ) -> bool {
+        let moving = action == gdk::DragAction::MOVE;
+        let sources = movable(&sources, destination);
+        if sources.is_empty() {
+            return false;
+        }
+        let mut errors = Vec::new();
+        for source in &sources {
+            if let Err(error) = transfer_item(source, destination, moving) {
+                errors.push(format!("{}: {error}", source.display()));
+            }
+        }
+        self.refresh();
+        if let Some(error) = errors.first() {
+            self.notify(&trf!(
+                "{} falha(s) · {error}",
+                "{} failure(s) · {error}",
+                errors.len()
+            ));
+        }
+        errors.len() < sources.len()
+    }
+}
+
+/// gtk-rs 0.18 has no safe binding for the views' `enable_model_drag_source`, which take
+/// a C array of target entries. This mirrors how gtk-rs builds that array for
+/// `WidgetExt::drag_source_set`; GTK copies the entries, so the borrow only needs to
+/// last for the call.
+fn enable_model_drag_source(
+    view: &gtk::TreeView,
+    icons: &gtk::IconView,
+    targets: &[gtk::TargetEntry],
+) {
+    use glib::translate::{IntoGlib, ToGlibPtr};
+    let stashes: Vec<_> = targets.iter().map(|target| target.to_glib_none()).collect();
+    let entries: Vec<gtk::ffi::GtkTargetEntry> =
+        stashes.iter().map(|stash| unsafe { *stash.0 }).collect();
+    let mask = gdk::ModifierType::BUTTON1_MASK.into_glib();
+    let actions = drag_actions().into_glib();
+    unsafe {
+        gtk::ffi::gtk_tree_view_enable_model_drag_source(
+            view.to_glib_none().0,
+            mask,
+            entries.as_ptr(),
+            entries.len() as i32,
+            actions,
+        );
+        gtk::ffi::gtk_icon_view_enable_model_drag_source(
+            icons.to_glib_none().0,
+            mask,
+            entries.as_ptr(),
+            entries.len() as i32,
+            actions,
+        );
+    }
+}
+
+/// GTK 3's tree view collapses a multi-selection as soon as a selected row is pressed,
+/// before it knows whether the press starts a drag. Defer that change: if a drag starts,
+/// the whole selection is dragged; if the button is released without a drag, only the
+/// pressed row stays selected, as a normal click would leave it.
+fn keep_selection_for_drag(view: &gtk::TreeView) {
+    let deferring = Rc::new(Cell::new(false));
+    let pending: Rc<RefCell<Option<gtk::TreePath>>> = Rc::default();
+    let blocked = deferring.clone();
+    view.selection()
+        .set_select_function(Some(Box::new(move |_, _, _, _| !blocked.get())));
+
+    let (flag, row) = (deferring.clone(), pending.clone());
+    view.connect_button_press_event(move |view, event| {
+        let plain = !event
+            .state()
+            .intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
+        if event.button() == 1
+            && event.event_type() == gdk::EventType::ButtonPress
+            && plain
+            && event.window() == view.bin_window()
+        {
+            let (x, y) = event.position();
+            let pressed = view
+                .path_at_pos(x as i32, y as i32)
+                .and_then(|(path, _, _, _)| path);
+            let selection = view.selection();
+            if let Some(pressed) = pressed.filter(|path| {
+                selection.path_is_selected(path) && selection.count_selected_rows() > 1
+            }) {
+                flag.set(true);
+                row.replace(Some(pressed));
+            }
+        }
+        glib::Propagation::Proceed
+    });
+
+    let (flag, row) = (deferring.clone(), pending.clone());
+    view.connect_button_release_event(move |view, event| {
+        if event.button() == 1 && flag.replace(false) {
+            if let Some(pressed) = row.take() {
+                let selection = view.selection();
+                selection.unselect_all();
+                selection.select_path(&pressed);
+            }
+        }
+        glib::Propagation::Proceed
+    });
+
+    // A drag swallows the release: keep the full selection and stop deferring.
+    view.connect_drag_begin(move |_, _| {
+        deferring.set(false);
+        pending.replace(None);
+    });
+}
+
+/// The icon view has the same problem but no select function: remember the selection
+/// when a selected item is pressed, and put it back if the press turns into a drag.
+fn keep_icon_selection_for_drag(icons: &gtk::IconView) {
+    let saved: Rc<RefCell<Vec<gtk::TreePath>>> = Rc::default();
+    let remember = saved.clone();
+    icons.connect_button_press_event(move |icons, event| {
+        remember.borrow_mut().clear();
+        let plain = !event
+            .state()
+            .intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK);
+        if event.button() == 1 && event.event_type() == gdk::EventType::ButtonPress && plain {
+            let (x, y) = event.position();
+            let selected = icons.selected_items();
+            if selected.len() > 1
+                && icons
+                    .path_at_pos(x as i32, y as i32)
+                    .is_some_and(|path| icons.path_is_selected(&path))
+            {
+                *remember.borrow_mut() = selected;
+            }
+        }
+        glib::Propagation::Proceed
+    });
+    icons.connect_drag_begin(move |icons, _| {
+        let rows = std::mem::take(&mut *saved.borrow_mut());
+        if !rows.is_empty() {
+            icons.unselect_all();
+            for row in &rows {
+                icons.select_path(row);
+            }
+        }
+    });
+}
+
+/// Drag selected items out of either view, and drop files onto either view.
+fn install_drag_and_drop(browser: &Rc<Browser>) {
+    let source_targets = [
+        gtk::TargetEntry::new("text/uri-list", gtk::TargetFlags::empty(), URI_LIST),
+        gtk::TargetEntry::new("text/plain", gtk::TargetFlags::empty(), PLAIN_TEXT),
+    ];
+    let dest_targets = [gtk::TargetEntry::new(
+        "text/uri-list",
+        gtk::TargetFlags::empty(),
+        URI_LIST,
+    )];
+    // The views' model drag source keeps a multi-selection intact when a drag starts,
+    // unlike a plain widget drag source.
+    enable_model_drag_source(&browser.view, &browser.icons, &source_targets);
+    keep_selection_for_drag(&browser.view);
+    keep_icon_selection_for_drag(&browser.icons);
+    let widgets: [gtk::Widget; 2] = [
+        browser.view.clone().upcast(),
+        browser.icons.clone().upcast(),
+    ];
+    for widget in widgets {
+        // Destination handling is ours, not the views' row reordering.
+        widget.drag_dest_set(gtk::DestDefaults::empty(), &dest_targets, drag_actions());
+
+        let state = Rc::downgrade(browser);
+        widget.connect_drag_begin(move |_, _| {
+            if let Some(state) = state.upgrade() {
+                let selected = state.selected();
+                DRAGGING.with(|dragging| *dragging.borrow_mut() = selected);
+            }
+        });
+
+        let state = Rc::downgrade(browser);
+        widget.connect_drag_data_get(move |widget, _, data, info, _| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let paths = state.selected();
+            if info == PLAIN_TEXT {
+                let text = paths
+                    .iter()
+                    .map(|path| path.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                data.set_text(&text);
+            } else {
+                let uris: Vec<String> = paths
+                    .iter()
+                    .map(|path| gio::File::for_path(path).uri().to_string())
+                    .collect();
+                let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
+                data.set_uris(&uris);
+            }
+            // The views' default would try to serialize model rows instead.
+            widget.stop_signal_emission_by_name("drag-data-get");
+        });
+
+        // A destination may ask the source to delete after a move. The files are already
+        // gone; never let the views delete model rows themselves, just reload.
+        let state = Rc::downgrade(browser);
+        widget.connect_drag_data_delete(move |widget, _| {
+            widget.stop_signal_emission_by_name("drag-data-delete");
+            if let Some(state) = state.upgrade() {
+                state.refresh();
+            }
+        });
+
+        let state = Rc::downgrade(browser);
+        widget.connect_drag_end(move |_, context| {
+            DRAGGING.with(|dragging| dragging.borrow_mut().clear());
+            if context.selected_action() == gdk::DragAction::MOVE {
+                if let Some(state) = state.upgrade() {
+                    state.refresh();
+                }
+            }
+        });
+
+        let state = Rc::downgrade(browser);
+        widget.connect_drag_motion(move |widget, context, x, y, time| {
+            let Some(state) = state.upgrade() else {
+                return false;
+            };
+            state.autoscroll(widget, y);
+            let (destination, row) = state.drop_destination(x, y);
+            let sources = DRAGGING.with(|dragging| dragging.borrow().clone());
+            let refused = !sources.is_empty() && movable(&sources, &destination).is_empty();
+            let action = if refused {
+                gdk::DragAction::empty()
+            } else {
+                drop_action(context.actions(), &sources, &destination)
+            };
+            state.highlight_drop(if action.is_empty() {
+                None
+            } else {
+                row.as_ref()
+            });
+            context.drag_status(action, time);
+            true
+        });
+
+        let state = Rc::downgrade(browser);
+        widget.connect_drag_leave(move |_, _, _| {
+            if let Some(state) = state.upgrade() {
+                state.highlight_drop(None);
+            }
+        });
+
+        widget.connect_drag_drop(move |widget, context, _, _, time| {
+            match widget.drag_dest_find_target(context, None) {
+                Some(target) => {
+                    widget.drag_get_data(context, &target, time);
+                    true
+                }
+                None => false,
+            }
+        });
+
+        let state = Rc::downgrade(browser);
+        widget.connect_drag_data_received(move |widget, context, x, y, data, _, time| {
+            widget.stop_signal_emission_by_name("drag-data-received");
+            let Some(state) = state.upgrade() else {
+                context.drag_finish(false, false, time);
+                return;
+            };
+            state.highlight_drop(None);
+            let sources: Vec<PathBuf> = data
+                .uris()
+                .iter()
+                .filter_map(|uri| gio::File::for_uri(uri).path())
+                .collect();
+            let (destination, _) = state.drop_destination(x, y);
+            let mut action = context.selected_action();
+            if action != gdk::DragAction::COPY && action != gdk::DragAction::MOVE {
+                action = drop_action(context.actions(), &sources, &destination);
+            }
+            let done = !action.is_empty() && state.receive_drop(sources, &destination, action);
+            // `del` stays false: files were moved by us, so the source must not delete anything.
+            context.drag_finish(done, false, time);
+        });
+    }
 }
 
 fn transfer_item(source: &Path, directory: &Path, moving: bool) -> Result<(), glib::Error> {
@@ -2492,6 +2906,43 @@ mod tests {
         assert_eq!(display_path(&home), "~");
         assert_eq!(display_path(&home.join("Downloads")), "~/Downloads");
         assert_eq!(display_path(Path::new("/etc")), "/etc");
+    }
+
+    #[test]
+    fn drops_move_on_the_same_disk_unless_a_modifier_narrows_it() {
+        let dir = scratch("drop");
+        let file = dir.join("file.txt");
+        fs::write(&file, b"x").unwrap();
+        fs::create_dir(dir.join("folder")).unwrap();
+        let sources = vec![file];
+        let both = gdk::DragAction::COPY | gdk::DragAction::MOVE;
+        let target = dir.join("folder");
+        assert_eq!(drop_action(both, &sources, &target), gdk::DragAction::MOVE);
+        // Ctrl leaves only COPY on offer, Shift only MOVE.
+        assert_eq!(
+            drop_action(gdk::DragAction::COPY, &sources, &target),
+            gdk::DragAction::COPY
+        );
+        assert_eq!(
+            drop_action(gdk::DragAction::MOVE, &sources, &target),
+            gdk::DragAction::MOVE
+        );
+        // Drags from other apps carry no known source: copy is the safe default.
+        assert_eq!(drop_action(both, &[], &target), gdk::DragAction::COPY);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn drops_that_change_nothing_are_filtered_out() {
+        let folder = PathBuf::from("/data/folder");
+        let file = PathBuf::from("/data/file.txt");
+        // Already in the destination.
+        assert!(movable(&[file.clone()], Path::new("/data")).is_empty());
+        // A folder into itself or into one of its children.
+        assert!(movable(&[folder.clone()], &folder).is_empty());
+        assert!(movable(&[folder.clone()], &folder.join("child")).is_empty());
+        // A real move survives.
+        assert_eq!(movable(&[file.clone()], &folder), vec![file]);
     }
 
     #[test]

@@ -13,6 +13,8 @@ A lightweight Linux file manager written in Rust with native GTK 3 widgets.
 - A customizable panoramic banner and four color profiles, with optional window transparency.
 - List and icon views, image thumbnails, file type icons, and sorting by name, type, size, or date.
 - A header search field: type a path to open it, or text to filter the current folder.
+- Drag and drop within a pane, between panes, and to or from other apps. Items move on the same
+  disk and copy across disks; hold Ctrl to copy or Shift to move.
 - Fast loading of large folders, read in the background without blocking the window.
 - Header and context menus for file operations, navigation, and view controls.
 - A per-user application launcher and default file manager integration for Xfce.
