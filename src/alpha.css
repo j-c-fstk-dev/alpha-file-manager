@@ -1,0 +1,104 @@
+.alpha {
+    background-color: @phosphor_bg;
+    background-image: linear-gradient(147deg, shade(@phosphor_selection, 0.83), @phosphor_bg 44%, shade(@phosphor_bg, 0.72));
+    color: #edf5f0;
+}
+.alpha headerbar {
+    background-image: none;
+    background-color: alpha(#171f22, 0.89);
+    color: #edf5f0;
+    border-bottom: 1px solid #2d3b3e;
+    box-shadow: none;
+}
+.alpha viewport { background-color: transparent; }
+.alpha .glass-sidebar {
+    background-color: alpha(#172022, 0.87);
+    border-right: 1px solid alpha(white, 0.11);
+}
+.alpha .rail { padding: 8px; background-color: transparent; }
+.alpha .brand-row { border-bottom: 1px solid alpha(white, 0.08); }
+.alpha .glass-toolbar {
+    min-height: 48px;
+    padding: 0 12px;
+    border-radius: 0;
+    border-bottom-color: alpha(white, 0.10);
+}
+.alpha .hero {
+    background-image: linear-gradient(118deg, @phosphor_selection, @phosphor_bg);
+    border-radius: 18px;
+    box-shadow: 0 8px 22px alpha(black, 0.28);
+}
+.alpha .home-title { font-size: 32px; font-weight: bold; }
+.alpha .section-title { color: #b1c6bc; font-weight: bold; }
+.alpha .muted { color: #b1c6bc; padding: 4px; }
+.alpha button {
+    background-image: none;
+    background-color: #202b2e;
+    color: #edf5f0;
+    border: 1px solid #354449;
+    border-radius: 8px;
+    box-shadow: none;
+    text-shadow: none;
+}
+.alpha button:hover { background-color: #2d4042; }
+.alpha button:checked { background-color: @phosphor_selection; color: #effff6; }
+.alpha button:focus, .alpha entry:focus { border-color: @phosphor; }
+.alpha button.location { padding: 14px 12px; min-height: 28px; }
+.alpha button.tab-close {
+    background-color: transparent;
+    border-color: transparent;
+    min-width: 20px;
+    min-height: 20px;
+    padding: 0;
+}
+.alpha button.tab-close:hover { background-color: #3d4c4e; }
+.alpha entry {
+    background-color: #1a2528;
+    color: #edf5f0;
+    border: 1px solid #354449;
+    border-radius: 8px;
+    box-shadow: none;
+}
+.alpha entry selection { background-color: @phosphor_selection; color: #ffffff; }
+.alpha notebook > header { background-color: #171f22; border-color: #2d3b3e; }
+.alpha notebook > header tab { color: #b1c6bc; padding: 5px 10px; }
+.alpha notebook > header tab:checked { background-color: #202d30; color: #edf5f0; box-shadow: inset 0 -2px @phosphor; }
+.alpha .tab-actions { border-bottom: 1px solid #253336; }
+.alpha .file-surface { border: 1px solid #354449; }
+.alpha treeview.view { background-color: #192326; color: #edf5f0; }
+.alpha treeview.view:selected { background-color: @phosphor_selection; color: #ffffff; }
+.alpha treeview.view header button { border-radius: 0; }
+.alpha paned > separator { background-color: #354449; }
+.alpha .rail button.current {
+    background-color: @phosphor_selection;
+    border-color: #5b8976;
+    color: #b8f6db;
+}
+
+
+.alpha .side-location { min-width: 32px; min-height: 30px; }
+.alpha .subheading { color: #b9c8c1; font-size: 14px; }
+menu.alpha { background-color: #1a2528; color: #edf5f0; }
+menu.alpha menuitem:hover { background-color: @phosphor_selection; }
+
+.alpha .home-title {
+    color: #ffffff;
+    font-weight: 700;
+    text-shadow: 0 2px 8px black;
+}
+.alpha button.banner-control {
+    background-color: alpha(#111c20, 0.78);
+    border-color: alpha(white, 0.34);
+    border-radius: 16px;
+    min-width: 34px;
+    min-height: 32px;
+}
+.alpha button.location {
+    background-color: alpha(#233034, 0.76);
+    border-color: alpha(white, 0.13);
+    border-radius: 12px;
+}
+.alpha button.location:hover { background-color: #324346; }
+.alpha.translucent .glass-sidebar,
+.alpha.translucent headerbar.glass-toolbar { background-color: alpha(#152023, 0.63); }
+.alpha.translucent button.location { background-color: alpha(#263539, 0.58); }
