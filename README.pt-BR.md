@@ -14,6 +14,8 @@ nativos e funciona sem WebView.
 - Banner panorâmico personalizável pelo botão de imagem na tela inicial.
 - Visualização em lista e em ícones, miniaturas de imagens, ícones por tipo e ordenação por nome, tamanho, tipo e datas.
 - Campo de busca no cabeçalho: digite um caminho para abri-lo ou um texto para filtrar a pasta atual.
+- Arrastar e soltar no mesmo painel, entre painéis e de ou para outros apps. No mesmo disco os
+  itens são movidos e entre discos são copiados; segure Ctrl para copiar ou Shift para mover.
 - Carregamento rápido de pastas grandes, lidas em segundo plano sem travar a janela.
 - Menus de contexto para propriedades, cópia, movimentação, renomeação e lixeira.
 - Perfis verde fósforo, âmbar, ciano e violeta, com opção de transparência nas Configurações.
