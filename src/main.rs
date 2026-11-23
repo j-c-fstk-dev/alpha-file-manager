@@ -13,8 +13,16 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::mpsc::{self, TryRecvError},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// Rows inserted into the model per idle callback, so huge folders never block the UI.
+const CHUNK: usize = 1500;
+/// Thumbnails are decoded once at this size and scaled down where they are drawn.
+const THUMBNAIL: i32 = 96;
+/// Width of one cell in the icon view, before zoom.
+const ICON_WIDTH: i32 = 120;
 
 #[derive(Clone, Default)]
 struct Transfer {
@@ -22,10 +30,49 @@ struct Transfer {
     moving: bool,
 }
 
+/// One directory entry, read off the UI thread. Everything displayed is pre-formatted here.
+#[derive(Clone)]
+struct Entry {
+    path: PathBuf,
+    name: String,
+    key: String,
+    hidden: bool,
+    directory: bool,
+    kind: &'static str,
+    icon: &'static str,
+    bytes: Option<u64>,
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+    size_text: String,
+    created_text: String,
+    modified_text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    List,
+    Icons,
+}
+
 struct Browser {
     root: glib::WeakRef<gtk::Box>,
     view: gtk::TreeView,
-    store: gtk::ListStore,
+    icons: gtk::IconView,
+    views: gtk::Stack,
+    mode: Cell<ViewMode>,
+    // Replaced wholesale on each load, so the filter never sees the per-row inserts.
+    store: RefCell<gtk::ListStore>,
+    filtered: RefCell<gtk::TreeModelFilter>,
+    filter_state: Rc<RefCell<(String, bool)>>,
+    entries: RefCell<Vec<Entry>>,
+    unreadable: Cell<usize>,
+    error: RefCell<Option<String>>,
+    notice: RefCell<Option<String>>,
+    load_gen: Cell<u64>,
+    populate_gen: Cell<u64>,
+    loading: Cell<bool>,
+    search_gen: Cell<u64>,
+    sort_combo: gtk::ComboBoxText,
     paths: Rc<RefCell<Vec<PathBuf>>>,
     history: Rc<RefCell<Vec<PathBuf>>>,
     forward: RefCell<Vec<PathBuf>>,
@@ -41,6 +88,121 @@ struct Browser {
     focus_stamp: Cell<u64>,
     thumbnails: RefCell<VecDeque<i32>>,
     thumbnail_pending: Cell<bool>,
+}
+
+fn list_store() -> gtk::ListStore {
+    gtk::ListStore::new(&[
+        u32::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        String::static_type(),
+        gtk::gdk_pixbuf::Pixbuf::static_type(),
+        String::static_type(),
+        bool::static_type(),
+    ])
+}
+
+/// Filters a store by the shared (text, show hidden) state.
+fn build_filter(
+    store: &gtk::ListStore,
+    filter_state: &Rc<RefCell<(String, bool)>>,
+) -> gtk::TreeModelFilter {
+    let filtered = gtk::TreeModelFilter::new(store, None);
+    let state = filter_state.clone();
+    filtered.set_visible_func(move |model, iter| {
+        let state = state.borrow();
+        let (text, show_hidden) = &*state;
+        if !show_hidden && model.value(iter, 9).get::<bool>().unwrap_or(false) {
+            return false;
+        }
+        text.is_empty()
+            || model
+                .value(iter, 8)
+                .get::<String>()
+                .is_ok_and(|key| key.contains(text.as_str()))
+    });
+    filtered
+}
+
+/// Reads one directory. Runs on a worker thread: no GTK calls here.
+fn scan(folder: &Path) -> Result<(Vec<Entry>, usize), String> {
+    let entries = fs::read_dir(folder).map_err(|error| error.to_string())?;
+    let mut rows = Vec::new();
+    let mut unreadable = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unreadable += 1;
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let metadata = entry.metadata().ok();
+        let link = metadata.as_ref().is_some_and(|meta| meta.is_symlink());
+        let directory =
+            metadata.as_ref().is_some_and(|meta| meta.is_dir()) || (link && path.is_dir());
+        let bytes = metadata
+            .as_ref()
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len());
+        let created = metadata.as_ref().and_then(|meta| meta.created().ok());
+        let modified = metadata.as_ref().and_then(|meta| meta.modified().ok());
+        let (kind, icon) = file_display(&path, directory, link);
+        rows.push(Entry {
+            key: name.to_lowercase(),
+            hidden: name.starts_with('.'),
+            size_text: bytes.map(format_size).unwrap_or_default(),
+            created_text: display_date(created),
+            modified_text: display_date(modified),
+            path,
+            name,
+            directory,
+            kind,
+            icon,
+            bytes,
+            created,
+            modified,
+        });
+    }
+    Ok((rows, unreadable))
+}
+
+/// Same ordering rules as before: folders first, then the selected column.
+fn sort_rows(rows: &mut [Entry], property: i32, descending: bool) {
+    rows.sort_unstable_by(|a, b| {
+        let order = match property {
+            2 => a.kind.cmp(b.kind),
+            3 => optional_order(a.bytes, b.bytes, descending),
+            5 => optional_order(a.created, b.created, descending),
+            6 => optional_order(a.modified, b.modified, descending),
+            _ => a.key.cmp(&b.key),
+        };
+        let ordered = if descending && matches!(property, 1 | 2) {
+            order.reverse()
+        } else {
+            order
+        };
+        (!a.directory)
+            .cmp(&!b.directory)
+            .then(ordered)
+            .then_with(|| (&a.key, &a.path).cmp(&(&b.key, &b.path)))
+    });
+}
+
+/// Scales a pixbuf down to fit a square, keeping its aspect ratio.
+fn fit(pixbuf: &gtk::gdk_pixbuf::Pixbuf, max: i32) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    let (width, height) = (pixbuf.width(), pixbuf.height());
+    if width <= max && height <= max {
+        return Some(pixbuf.clone());
+    }
+    let ratio = f64::from(max) / f64::from(width.max(height));
+    pixbuf.scale_simple(
+        (f64::from(width) * ratio).round().max(1.0) as i32,
+        (f64::from(height) * ratio).round().max(1.0) as i32,
+        gtk::gdk_pixbuf::InterpType::Bilinear,
+    )
 }
 
 impl Browser {
@@ -76,7 +238,37 @@ impl Browser {
         let copy = icon_button("edit-copy-symbolic", tr!("Copiar", "Copy"));
         let cut = icon_button("edit-cut-symbolic", tr!("Recortar", "Cut"));
         let paste = icon_button("edit-paste-symbolic", tr!("Colar", "Paste"));
+        let sort_combo = gtk::ComboBoxText::new();
+        for (id, label) in [
+            ("1", tr!("Nome", "Name")),
+            ("2", tr!("Tipo", "Type")),
+            ("3", tr!("Tamanho", "Size")),
+            ("6", tr!("Modificação", "Modified")),
+        ] {
+            sort_combo.append(Some(id), label);
+        }
+        sort_combo.set_active_id(Some("1"));
+        label_control(&sort_combo, tr!("Ordenar por", "Sort by"));
+        let list_mode = gtk::ToggleButton::new();
+        list_mode.add(&gtk::Image::from_icon_name(
+            Some("view-list-symbolic"),
+            gtk::IconSize::Button,
+        ));
+        label_control(&list_mode, tr!("Visualização em lista", "List View"));
+        let icon_mode = gtk::ToggleButton::new();
+        icon_mode.add(&gtk::Image::from_icon_name(
+            Some("view-grid-symbolic"),
+            gtk::IconSize::Button,
+        ));
+        label_control(&icon_mode, tr!("Visualização em ícones", "Icon View"));
+        list_mode.set_active(true);
+        let modes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        modes.style_context().add_class("linked");
+        modes.pack_start(&list_mode, false, false, 0);
+        modes.pack_start(&icon_mode, false, false, 0);
         actions.pack_start(&filter, true, true, 0);
+        actions.pack_start(&sort_combo, false, false, 0);
+        actions.pack_start(&modes, false, false, 0);
         for button in [
             hidden.upcast_ref(),
             &create,
@@ -90,17 +282,12 @@ impl Browser {
         }
         root.pack_start(&actions, false, false, 0);
 
-        let store = gtk::ListStore::new(&[
-            u32::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            String::static_type(),
-            gtk::gdk_pixbuf::Pixbuf::static_type(),
-        ]);
-        let view = gtk::TreeView::with_model(&store);
+        // Columns: 0 index, 1 name, 2 type, 3 size, 4 icon, 5 created, 6 modified,
+        // 7 thumbnail, 8 lowercase name (filter key), 9 hidden flag.
+        let store = list_store();
+        let filter_state = Rc::new(RefCell::new((String::new(), false)));
+        let filtered = build_filter(&store, &filter_state);
+        let view = gtk::TreeView::with_model(&filtered);
         view.selection().set_mode(gtk::SelectionMode::Multiple);
         for (index, name) in [
             (1, tr!("Nome", "Name")),
@@ -141,7 +328,7 @@ impl Browser {
                         renderer.set_property("pixbuf", Option::<gtk::gdk_pixbuf::Pixbuf>::None);
                         renderer.set_property("icon-name", Option::<String>::None);
                         if let Some(preview) = preview {
-                            renderer.set_property("pixbuf", preview);
+                            renderer.set_property("pixbuf", fit(&preview, 24));
                         } else {
                             renderer.set_property("icon-name", name);
                         }
@@ -152,10 +339,56 @@ impl Browser {
             gtk::prelude::TreeViewColumnExt::add_attribute(&column, &renderer, "text", index);
             view.append_column(&column);
         }
-        let scroll = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-        scroll.style_context().add_class("file-surface");
-        scroll.add(&view);
-        root.pack_start(&scroll, true, true, 0);
+        let list_scroll =
+            gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+        list_scroll.style_context().add_class("file-surface");
+        list_scroll.add(&view);
+
+        let icons = gtk::IconView::new();
+        icons.set_model(Some(&filtered));
+        icons.set_selection_mode(gtk::SelectionMode::Multiple);
+        icons.set_item_orientation(gtk::Orientation::Vertical);
+        icons.set_item_width(ICON_WIDTH);
+        icons.set_spacing(6);
+        icons.set_item_padding(10);
+        let icon_pixbuf = gtk::CellRendererPixbuf::new();
+        // GtkIconSize Dialog (48px) for themed icons; the property is a plain uint.
+        icon_pixbuf.set_property("stock-size", 6u32);
+        gtk::prelude::CellLayoutExt::pack_start(&icons, &icon_pixbuf, false);
+        gtk::prelude::CellLayoutExt::set_cell_data_func(
+            &icons,
+            &icon_pixbuf,
+            Some(Box::new(|_, renderer, model, iter| {
+                let preview = model
+                    .value(iter, 7)
+                    .get::<Option<gtk::gdk_pixbuf::Pixbuf>>()
+                    .unwrap_or_default();
+                let name = model.value(iter, 4).get::<String>().unwrap_or_default();
+                renderer.set_property("pixbuf", Option::<gtk::gdk_pixbuf::Pixbuf>::None);
+                renderer.set_property("icon-name", Option::<String>::None);
+                if let Some(preview) = preview {
+                    renderer.set_property("pixbuf", fit(&preview, 64));
+                } else {
+                    renderer.set_property("icon-name", name);
+                }
+            })),
+        );
+        let icon_text = gtk::CellRendererText::new();
+        icon_text.set_property("wrap-width", ICON_WIDTH - 24);
+        icon_text.set_property("wrap-mode", gtk::pango::WrapMode::WordChar);
+        icon_text.set_property("alignment", gtk::pango::Alignment::Center);
+        gtk::prelude::CellLayoutExt::pack_start(&icons, &icon_text, true);
+        gtk::prelude::CellLayoutExt::add_attribute(&icons, &icon_text, "text", 1);
+        let icon_scroll =
+            gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+        icon_scroll.style_context().add_class("file-surface");
+        icon_scroll.add(&icons);
+
+        let views = gtk::Stack::new();
+        views.add_named(&list_scroll, "list");
+        views.add_named(&icon_scroll, "icons");
+        views.set_visible_child_name("list");
+        root.pack_start(&views, true, true, 0);
         let status = gtk::Label::new(None);
         status.style_context().add_class("muted");
         status.set_xalign(0.0);
@@ -165,7 +398,21 @@ impl Browser {
         let browser = Rc::new(Self {
             root: root.downgrade(),
             view,
-            store,
+            icons,
+            views,
+            mode: Cell::new(ViewMode::List),
+            store: RefCell::new(store),
+            filtered: RefCell::new(filtered),
+            filter_state,
+            entries: Default::default(),
+            unreadable: Cell::default(),
+            error: Default::default(),
+            notice: Default::default(),
+            load_gen: Cell::default(),
+            populate_gen: Cell::default(),
+            loading: Cell::new(true),
+            search_gen: Cell::default(),
+            sort_combo: sort_combo.clone(),
             paths: Default::default(),
             history: Default::default(),
             forward: Default::default(),
@@ -195,19 +442,52 @@ impl Browser {
                     return;
                 };
                 let (old, descending) = state.sort.get();
-                let next = old == id && !descending;
-                state.sort.set((id, next));
-                for (index, col) in [1, 2, 3, 5, 6].into_iter().zip(state.view.columns()) {
-                    col.set_sort_indicator(index == id);
-                    col.set_sort_order(if next {
-                        gtk::SortType::Descending
-                    } else {
-                        gtk::SortType::Ascending
-                    });
-                }
-                state.refresh();
+                state.set_sort(id, old == id && !descending);
             });
         }
+        let state = Rc::downgrade(&browser);
+        sort_combo.connect_changed(move |combo| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let Some(id) = combo.active_id().and_then(|id| id.parse::<i32>().ok()) else {
+                return;
+            };
+            if state.sort.get().0 != id {
+                state.set_sort(id, false);
+            }
+        });
+        // Two toggles acting as one radio group: switch the mode first, then the sibling.
+        let state = Rc::downgrade(&browser);
+        let other = icon_mode.downgrade();
+        list_mode.connect_toggled(move |button| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if button.is_active() {
+                state.set_mode(ViewMode::List);
+                if let Some(other) = other.upgrade() {
+                    other.set_active(false);
+                }
+            } else if state.mode() == ViewMode::List {
+                button.set_active(true);
+            }
+        });
+        let state = Rc::downgrade(&browser);
+        let other = list_mode.downgrade();
+        icon_mode.connect_toggled(move |button| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if button.is_active() {
+                state.set_mode(ViewMode::Icons);
+                if let Some(other) = other.upgrade() {
+                    other.set_active(false);
+                }
+            } else if state.mode() == ViewMode::Icons {
+                button.set_active(true);
+            }
+        });
         let state = Rc::downgrade(&browser);
         browser.view.connect_map(move |_| {
             if let Some(state) = state.upgrade() {
@@ -215,13 +495,27 @@ impl Browser {
             }
         });
         let state = Rc::downgrade(&browser);
-        scroll.vadjustment().connect_value_changed(move |_| {
+        browser.icons.connect_map(move |_| {
+            if let Some(state) = state.upgrade() {
+                state.queue_thumbnails();
+            }
+        });
+        for scroll in [&list_scroll, &icon_scroll] {
+            let state = Rc::downgrade(&browser);
+            scroll.vadjustment().connect_value_changed(move |_| {
+                if let Some(state) = state.upgrade() {
+                    state.queue_thumbnails();
+                }
+            });
+        }
+        let state = Rc::downgrade(&browser);
+        browser.view.connect_size_allocate(move |_, _| {
             if let Some(state) = state.upgrade() {
                 state.queue_thumbnails();
             }
         });
         let state = Rc::downgrade(&browser);
-        browser.view.connect_size_allocate(move |_, _| {
+        browser.icons.connect_size_allocate(move |_, _| {
             if let Some(state) = state.upgrade() {
                 state.queue_thumbnails();
             }
@@ -282,18 +576,38 @@ impl Browser {
         });
         let state = Rc::downgrade(&browser);
         browser.filter.connect_search_changed(move |_| {
-            if let Some(state) = state.upgrade() {
-                state.refresh();
-            }
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            // Debounce: filter once the user pauses typing, not on every keystroke.
+            let generation = state.search_gen.get().wrapping_add(1);
+            state.search_gen.set(generation);
+            let state = Rc::downgrade(&state);
+            glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                if let Some(state) = state.upgrade() {
+                    if state.search_gen.get() == generation {
+                        state.apply_filter();
+                    }
+                }
+            });
         });
         let state = Rc::downgrade(&browser);
         browser.hidden.connect_toggled(move |_| {
             if let Some(state) = state.upgrade() {
-                state.refresh();
+                state.apply_filter();
             }
         });
         let state = Rc::downgrade(&browser);
         browser.view.connect_row_activated(move |_, row, _| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if let Some(path) = state.path_at(row) {
+                state.open(&path);
+            }
+        });
+        let state = Rc::downgrade(&browser);
+        browser.icons.connect_item_activated(move |_, row| {
             let Some(state) = state.upgrade() else {
                 return;
             };
@@ -412,7 +726,7 @@ impl Browser {
             }
             state.refresh();
             if let Some(error) = errors.first() {
-                state.status.set_text(&trf!(
+                state.notify(&trf!(
                     "{} falha(s) · {error}",
                     "{} failure(s) · {error}",
                     errors.len()
@@ -443,168 +757,26 @@ impl Browser {
             let row = view
                 .path_at_pos(x as i32, y as i32)
                 .and_then(|(path, _, _, _)| path);
-            let selection = view.selection();
-            if let Some(row) = row.as_ref() {
-                if !selection.path_is_selected(row) {
-                    selection.unselect_all();
-                    selection.select_path(row);
-                }
-            } else {
-                selection.unselect_all();
-            }
-            let selected = state.selected();
-            let menu = gtk::Menu::new();
-            if let [path] = selected.as_slice() {
-                let target = path.clone();
-                let owner = Rc::downgrade(&state);
-                menu_action(&menu, tr!("Abrir", "Open"), move || {
-                    if let Some(owner) = owner.upgrade() {
-                        owner.open(&target);
-                    }
-                });
-                let target = path.clone();
-                menu_action(&menu, tr!("Copiar caminho", "Copy Path"), move || {
-                    gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD)
-                        .set_text(&target.to_string_lossy());
-                });
-                let target = path.clone();
-                let owner = Rc::downgrade(&state);
-                menu_action(&menu, tr!("Propriedades", "Properties"), move || {
-                    if let Some(owner) = owner.upgrade() {
-                        owner.properties(&target);
-                    }
-                });
-            }
-            let folder_to_pin = match selected.as_slice() {
-                [] => Some(state.folder.borrow().clone()),
-                [path] if path.is_dir() => Some(path.clone()),
-                _ => None,
-            };
-            if let Some(path) = folder_to_pin {
-                let owner = Rc::downgrade(&state);
-                menu_action(
-                    &menu,
-                    tr!(
-                        "Fixar pasta no início e na lateral",
-                        "Pin Folder to Home and Sidebar"
-                    ),
-                    move || {
-                        if let Err(error) = preferences::pin(&path) {
-                            if let Some(owner) = owner.upgrade() {
-                                owner.status.set_text(&error.to_string());
-                            }
-                        }
-                    },
-                );
-            }
-            if let [path] = selected.as_slice() {
-                if path.is_dir() {
-                    let target = path.clone();
-                    let owner = Rc::downgrade(&state);
-                    menu_action(
-                        &menu,
-                        tr!("Abrir em nova janela", "Open in New Window"),
-                        move || {
-                            if let Err(error) = commands::new_window(&target) {
-                                if let Some(owner) = owner.upgrade() {
-                                    owner.status.set_text(&error.to_string());
-                                }
-                            }
-                        },
-                    );
-                    let target = path.clone();
-                    let owner = Rc::downgrade(&state);
-                    menu_action(
-                        &menu,
-                        tr!("Abrir em nova aba", "Open in New Tab"),
-                        move || {
-                            if let Some(owner) = owner.upgrade() {
-                                owner.open_tab(&target);
-                            }
-                        },
-                    );
-                } else {
-                    let target = path.clone();
-                    let owner = Rc::downgrade(&state);
-                    menu_action(&menu, tr!("Abrir com…", "Open With…"), move || {
-                        if let Some(owner) = owner.upgrade() {
-                            owner.open_with(&target);
-                        }
-                    });
-                }
-            }
-            if selected.is_empty()
-                || selected
-                    .as_slice()
-                    .first()
-                    .is_some_and(|path| selected.len() == 1 && path.is_dir())
-            {
-                let directory = selected
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| state.folder.borrow().clone());
-                let owner = Rc::downgrade(&state);
-                menu_action(
-                    &menu,
-                    tr!("Abrir terminal aqui", "Open Terminal Here"),
-                    move || {
-                        if let Err(error) = commands::terminal(&directory) {
-                            if let Some(owner) = owner.upgrade() {
-                                owner.status.set_text(&error.to_string());
-                            }
-                        }
-                    },
-                );
-            }
-            let commands = [
-                ("new-folder", tr!("Nova pasta", "New Folder")),
-                ("paste", tr!("Colar", "Paste")),
-                (
-                    "empty-file",
-                    tr!("Criar arquivo vazio", "Create Empty File"),
-                ),
-                ("copy", tr!("Copiar", "Copy")),
-                ("cut", tr!("Recortar", "Cut")),
-                ("rename", tr!("Renomear", "Rename")),
-                ("trash", tr!("Mover para a lixeira", "Move to Trash")),
-            ];
-            for (name, label) in commands {
-                let enabled = match name {
-                    "new-folder" | "paste" | "empty-file" => true,
-                    "rename" => selected.len() == 1,
-                    _ => !selected.is_empty(),
-                };
-                if enabled {
-                    let owner = Rc::downgrade(&state);
-                    menu_action(&menu, label, move || {
-                        if let Some(owner) = owner.upgrade() {
-                            owner.dispatch(name);
-                        }
-                    });
-                }
-            }
-            if !selected.is_empty() {
-                let owner = Rc::downgrade(&state);
-                menu_action(
-                    &menu,
-                    tr!("Excluir permanentemente…", "Delete Permanently…"),
-                    move || {
-                        if let Some(owner) = owner.upgrade() {
-                            owner.dispatch("delete");
-                        }
-                    },
-                );
-            } else {
-                let owner = Rc::downgrade(&state);
-                menu_action(&menu, tr!("Recarregar", "Reload"), move || {
-                    if let Some(owner) = owner.upgrade() {
-                        owner.dispatch("reload");
-                    }
-                });
-            }
-            show_menu(&menu, event);
+            state.prepare_selection(row.as_ref());
+            show_context_menu(&state, event);
             glib::Propagation::Stop
         });
+        let state = Rc::downgrade(&browser);
+        browser
+            .icons
+            .connect_button_press_event(move |icons, event| {
+                if event.button() != 3 {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(state) = state.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                let (x, y) = event.position();
+                let row = icons.path_at_pos(x as i32, y as i32);
+                state.prepare_selection(row.as_ref());
+                show_context_menu(&state, event);
+                glib::Propagation::Stop
+            });
         (browser, root)
     }
 
@@ -677,7 +849,7 @@ impl Browser {
     }
 
     fn load_thumbnails(&self) -> bool {
-        let Some((start, end)) = self.view.visible_range() else {
+        let Some((start, end)) = self.visible_range() else {
             return false;
         };
         let (Some(first), Some(last)) = (
@@ -689,14 +861,23 @@ impl Browser {
         let paths = self.paths.borrow();
         let mut cached = self.thumbnails.borrow_mut();
         let mut attempted = 0;
-        for index in first..=last.min(first.saturating_add(119)) {
+        // Positions are in the filtered (visible) model; the store is indexed by entry.
+        for position in first..=last.min(first.saturating_add(119)) {
+            let Some(row) = self.filtered().iter_nth_child(None, position) else {
+                continue;
+            };
+            let Ok(index) = self.filtered().value(&row, 0).get::<u32>() else {
+                continue;
+            };
+            let index = index as i32;
             if cached.contains(&index) {
                 continue;
             }
-            let Some(iter) = self.store.iter_nth_child(None, index) else {
+            let Some(iter) = self.store().iter_nth_child(None, index) else {
                 continue;
             };
-            if self.store.value(&iter, 2).get::<String>().as_deref() != Ok(tr!("Imagem", "Image")) {
+            if self.store().value(&iter, 2).get::<String>().as_deref() != Ok(tr!("Imagem", "Image"))
+            {
                 continue;
             }
             let Some(path) = paths.get(index as usize) else {
@@ -708,14 +889,14 @@ impl Browser {
             attempted += 1;
             cached.push_back(index);
             if let Some(preview) = image_thumbnail(path) {
-                self.store.set_value(&iter, 7, &preview.to_value());
+                self.store().set_value(&iter, 7, &preview.to_value());
             }
             if cached.len() > 160 {
                 if let Some(old) = cached
                     .pop_front()
-                    .and_then(|row| self.store.iter_nth_child(None, row))
+                    .and_then(|row| self.store().iter_nth_child(None, row))
                 {
-                    self.store.set_value(
+                    self.store().set_value(
                         &old,
                         7,
                         &Option::<gtk::gdk_pixbuf::Pixbuf>::None.to_value(),
@@ -765,24 +946,274 @@ impl Browser {
     fn finish<T, E: std::fmt::Display>(self: &Rc<Self>, result: Result<T, E>) {
         self.refresh();
         if let Err(error) = result {
-            self.status.set_text(&error.to_string());
+            self.notify(&error.to_string());
         }
     }
 
+    /// Shows a message in the status bar even though a reload is in flight.
+    fn notify(&self, text: &str) {
+        *self.notice.borrow_mut() = Some(text.to_owned());
+        self.update_status();
+    }
+
     fn path_at(&self, row: &gtk::TreePath) -> Option<PathBuf> {
-        let iter = self.store.iter(row)?;
-        let index = self.store.value(&iter, 0).get::<u32>().ok()?;
+        let iter = self.filtered().iter(row)?;
+        let index = self.filtered().value(&iter, 0).get::<u32>().ok()?;
         self.paths.borrow().get(index as usize).cloned()
     }
 
+    fn store(&self) -> gtk::ListStore {
+        self.store.borrow().clone()
+    }
+
+    fn filtered(&self) -> gtk::TreeModelFilter {
+        self.filtered.borrow().clone()
+    }
+
+    fn mode(&self) -> ViewMode {
+        self.mode.get()
+    }
+
+    fn selected_rows(&self) -> Vec<gtk::TreePath> {
+        match self.mode() {
+            ViewMode::List => self.view.selection().selected_rows().0,
+            ViewMode::Icons => self.icons.selected_items(),
+        }
+    }
+
     fn selected(&self) -> Vec<PathBuf> {
-        self.view
-            .selection()
-            .selected_rows()
-            .0
+        self.selected_rows()
             .iter()
             .filter_map(|row| self.path_at(row))
             .collect()
+    }
+
+    fn select_row(&self, row: &gtk::TreePath) {
+        match self.mode() {
+            ViewMode::List => self.view.selection().select_path(row),
+            ViewMode::Icons => self.icons.select_path(row),
+        }
+    }
+
+    fn unselect_row(&self, row: &gtk::TreePath) {
+        match self.mode() {
+            ViewMode::List => self.view.selection().unselect_path(row),
+            ViewMode::Icons => self.icons.unselect_path(row),
+        }
+    }
+
+    fn row_selected(&self, row: &gtk::TreePath) -> bool {
+        match self.mode() {
+            ViewMode::List => self.view.selection().path_is_selected(row),
+            ViewMode::Icons => self.icons.path_is_selected(row),
+        }
+    }
+
+    fn select_all_rows(&self) {
+        match self.mode() {
+            ViewMode::List => self.view.selection().select_all(),
+            ViewMode::Icons => self.icons.select_all(),
+        }
+    }
+
+    fn unselect_all_rows(&self) {
+        match self.mode() {
+            ViewMode::List => self.view.selection().unselect_all(),
+            ViewMode::Icons => self.icons.unselect_all(),
+        }
+    }
+
+    /// Right-click keeps an existing selection, otherwise selects only the clicked row.
+    fn prepare_selection(&self, row: Option<&gtk::TreePath>) {
+        match row {
+            Some(row) => {
+                if !self.row_selected(row) {
+                    self.unselect_all_rows();
+                    self.select_row(row);
+                }
+            }
+            None => self.unselect_all_rows(),
+        }
+    }
+
+    fn visible_range(&self) -> Option<(gtk::TreePath, gtk::TreePath)> {
+        match self.mode() {
+            ViewMode::List => self.view.visible_range(),
+            ViewMode::Icons => self.icons.visible_range(),
+        }
+    }
+
+    fn set_mode(self: &Rc<Self>, mode: ViewMode) {
+        if self.mode.replace(mode) == mode {
+            return;
+        }
+        self.views.set_visible_child_name(match mode {
+            ViewMode::List => "list",
+            ViewMode::Icons => "icons",
+        });
+        self.queue_thumbnails();
+    }
+
+    fn set_sort(self: &Rc<Self>, property: i32, descending: bool) {
+        self.sort.set((property, descending));
+        for (index, column) in [1, 2, 3, 5, 6].into_iter().zip(self.view.columns()) {
+            column.set_sort_indicator(index == property);
+            column.set_sort_order(if descending {
+                gtk::SortType::Descending
+            } else {
+                gtk::SortType::Ascending
+            });
+        }
+        self.sort_combo.set_active_id(Some(&property.to_string()));
+        // Sorting works on the cached listing, so it never touches the disk.
+        self.populate();
+    }
+
+    fn apply_filter(&self) {
+        let text = self.filter.text().to_lowercase();
+        *self.filter_state.borrow_mut() = (text, self.hidden.is_active());
+        self.filtered().refilter();
+        self.update_status();
+    }
+
+    fn update_status(&self) {
+        if let Some(error) = self.error.borrow().as_ref() {
+            self.status.set_text(error);
+            return;
+        }
+        if self.loading.get() {
+            self.status.set_text(tr!("Carregando…", "Loading…"));
+            return;
+        }
+        if let Some(notice) = self.notice.borrow().as_ref() {
+            self.status.set_text(notice);
+            return;
+        }
+        let shown = self.filtered().iter_n_children(None) as usize;
+        let unreadable = self.unreadable.get();
+        self.status.set_text(&if unreadable == 0 {
+            trf!("{} itens", "{} items", shown)
+        } else {
+            trf!(
+                "{} itens · {unreadable} entradas ilegíveis",
+                "{} items · {unreadable} unreadable entries",
+                shown
+            )
+        });
+    }
+
+    fn refresh(self: &Rc<Self>) {
+        // Any notice belongs to the previous action; callers set a new one after refreshing.
+        *self.notice.borrow_mut() = None;
+        self.thumbnails.borrow_mut().clear();
+        let generation = self.load_gen.get().wrapping_add(1);
+        self.load_gen.set(generation);
+        self.loading.set(true);
+        self.status.set_text(tr!("Carregando…", "Loading…"));
+        let folder = self.folder.borrow().clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(scan(&folder));
+        });
+        let state = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(8), move || {
+            match receiver.try_recv() {
+                Err(TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                Ok(result) => {
+                    if let Some(state) = state.upgrade() {
+                        if state.load_gen.get() == generation {
+                            state.apply(result);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    fn apply(self: &Rc<Self>, result: Result<(Vec<Entry>, usize), String>) {
+        match result {
+            Ok((entries, unreadable)) => {
+                *self.entries.borrow_mut() = entries;
+                self.unreadable.set(unreadable);
+                *self.error.borrow_mut() = None;
+            }
+            Err(error) => {
+                self.entries.borrow_mut().clear();
+                self.unreadable.set(0);
+                *self.error.borrow_mut() = Some(error);
+            }
+        }
+        self.populate();
+    }
+
+    /// Rebuilds the listing from the cached entries, sorted, in chunks across idle callbacks.
+    /// The new store is filled off-screen and swapped in when complete, so the current list
+    /// stays usable and consistent (paths, filter and store always match) while it loads.
+    fn populate(self: &Rc<Self>) {
+        let (property, descending) = self.sort.get();
+        let mut rows = self.entries.borrow().clone();
+        sort_rows(&mut rows, property, descending);
+        // A new sort or a new folder cancels any population still in progress.
+        let generation = self.populate_gen.get().wrapping_add(1);
+        self.populate_gen.set(generation);
+        let scan = self.load_gen.get();
+        self.loading.set(true);
+        let store = list_store();
+        let rows = Rc::new(rows);
+        let next = Cell::new(0usize);
+        let state = Rc::downgrade(self);
+        glib::idle_add_local(move || {
+            let Some(state) = state.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if state.load_gen.get() != scan || state.populate_gen.get() != generation {
+                return glib::ControlFlow::Break;
+            }
+            let start = next.get();
+            let end = (start + CHUNK).min(rows.len());
+            for (offset, entry) in rows[start..end].iter().enumerate() {
+                let index = (start + offset) as u32;
+                store.insert_with_values(
+                    None,
+                    &[
+                        (0, &index),
+                        (1, &entry.name),
+                        (2, &entry.kind),
+                        (3, &entry.size_text),
+                        (4, &entry.icon),
+                        (5, &entry.created_text),
+                        (6, &entry.modified_text),
+                        (8, &entry.key),
+                        (9, &entry.hidden),
+                    ],
+                );
+            }
+            next.set(end);
+            if end < rows.len() {
+                return glib::ControlFlow::Continue;
+            }
+            state.install(
+                store.clone(),
+                rows.iter().map(|entry| entry.path.clone()).collect(),
+            );
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Swaps in a finished listing: the filter is built once over the complete store.
+    fn install(self: &Rc<Self>, store: gtk::ListStore, paths: Vec<PathBuf>) {
+        let filtered = build_filter(&store, &self.filter_state);
+        self.view.set_model(Some(&filtered));
+        self.icons.set_model(Some(&filtered));
+        *self.paths.borrow_mut() = paths;
+        self.thumbnails.borrow_mut().clear();
+        *self.store.borrow_mut() = store;
+        *self.filtered.borrow_mut() = filtered;
+        self.loading.set(false);
+        self.update_status();
+        self.queue_thumbnails();
     }
 
     fn navigate(self: &Rc<Self>, path: &Path, remember: bool) -> bool {
@@ -806,98 +1237,159 @@ impl Browser {
         self.refresh();
         true
     }
+}
 
-    fn refresh(self: &Rc<Self>) {
-        self.thumbnails.borrow_mut().clear();
-        self.store.clear();
-        self.paths.borrow_mut().clear();
-        let folder = self.folder.borrow();
-        let entries = match fs::read_dir(&*folder) {
-            Ok(entries) => entries,
-            Err(error) => {
-                self.status.set_text(&error.to_string());
-                return;
+fn show_context_menu(state: &Rc<Browser>, event: &gdk::EventButton) {
+    let selected = state.selected();
+    let menu = gtk::Menu::new();
+    if let [path] = selected.as_slice() {
+        let target = path.clone();
+        let owner = Rc::downgrade(state);
+        menu_action(&menu, tr!("Abrir", "Open"), move || {
+            if let Some(owner) = owner.upgrade() {
+                owner.open(&target);
             }
-        };
-        let filter = self.filter.text().to_lowercase();
-        let show_hidden = self.hidden.is_active();
-        let mut rows = Vec::new();
-        let mut unreadable = 0;
-        for entry in entries {
-            let Ok(entry) = entry else {
-                unreadable += 1;
-                continue;
-            };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let key = name.to_lowercase();
-            if (!show_hidden && name.starts_with('.')) || !key.contains(&filter) {
-                continue;
+        });
+        let target = path.clone();
+        menu_action(&menu, tr!("Copiar caminho", "Copy Path"), move || {
+            gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD).set_text(&target.to_string_lossy());
+        });
+        let target = path.clone();
+        let owner = Rc::downgrade(state);
+        menu_action(&menu, tr!("Propriedades", "Properties"), move || {
+            if let Some(owner) = owner.upgrade() {
+                owner.properties(&target);
             }
-            let path = entry.path();
-            let metadata = entry.metadata().ok();
-            let link = metadata.as_ref().is_some_and(|meta| meta.is_symlink());
-            let directory =
-                metadata.as_ref().is_some_and(|meta| meta.is_dir()) || (link && path.is_dir());
-            let bytes = metadata
-                .as_ref()
-                .filter(|meta| meta.is_file())
-                .map(|meta| meta.len());
-            let created = metadata.as_ref().and_then(|meta| meta.created().ok());
-            let modified = metadata.as_ref().and_then(|meta| meta.modified().ok());
-            let (kind, icon) = file_display(&path, directory, link);
-            rows.push((
-                !directory, key, name, kind, bytes, path, icon, created, modified,
-            ));
-        }
-        let (property, descending) = self.sort.get();
-        rows.sort_unstable_by(|a, b| {
-            let order = match property {
-                2 => a.3.cmp(b.3),
-                3 => optional_order(a.4, b.4, descending),
-                5 => optional_order(a.7, b.7, descending),
-                6 => optional_order(a.8, b.8, descending),
-                _ => a.1.cmp(&b.1),
-            };
-            let ordered = if descending && matches!(property, 1 | 2) {
-                order.reverse()
-            } else {
-                order
-            };
-            a.0.cmp(&b.0)
-                .then(ordered)
-                .then_with(|| (&a.1, &a.5).cmp(&(&b.1, &b.5)))
         });
-        let mut paths = self.paths.borrow_mut();
-        for (_, _, name, kind, bytes, path, icon, created, modified) in rows {
-            let index = paths.len() as u32;
-            paths.push(path);
-            let size = bytes.map(format_size).unwrap_or_default();
-            let created = display_date(created);
-            let modified = display_date(modified);
-            self.store.insert_with_values(
-                None,
-                &[
-                    (0, &index),
-                    (1, &name),
-                    (2, &kind),
-                    (3, &size),
-                    (4, &icon),
-                    (5, &created),
-                    (6, &modified),
-                ],
-            );
-        }
-        self.status.set_text(&if unreadable == 0 {
-            trf!("{} itens", "{} items", paths.len())
-        } else {
-            trf!(
-                "{} itens · {unreadable} entradas ilegíveis",
-                "{} items · {unreadable} unreadable entries",
-                paths.len()
-            )
-        });
-        self.queue_thumbnails();
     }
+    let folder_to_pin = match selected.as_slice() {
+        [] => Some(state.folder.borrow().clone()),
+        [path] if path.is_dir() => Some(path.clone()),
+        _ => None,
+    };
+    if let Some(path) = folder_to_pin {
+        let owner = Rc::downgrade(state);
+        menu_action(
+            &menu,
+            tr!(
+                "Fixar pasta no início e na lateral",
+                "Pin Folder to Home and Sidebar"
+            ),
+            move || {
+                if let Err(error) = preferences::pin(&path) {
+                    if let Some(owner) = owner.upgrade() {
+                        owner.status.set_text(&error.to_string());
+                    }
+                }
+            },
+        );
+    }
+    if let [path] = selected.as_slice() {
+        if path.is_dir() {
+            let target = path.clone();
+            let owner = Rc::downgrade(state);
+            menu_action(
+                &menu,
+                tr!("Abrir em nova janela", "Open in New Window"),
+                move || {
+                    if let Err(error) = commands::new_window(&target) {
+                        if let Some(owner) = owner.upgrade() {
+                            owner.status.set_text(&error.to_string());
+                        }
+                    }
+                },
+            );
+            let target = path.clone();
+            let owner = Rc::downgrade(state);
+            menu_action(
+                &menu,
+                tr!("Abrir em nova aba", "Open in New Tab"),
+                move || {
+                    if let Some(owner) = owner.upgrade() {
+                        owner.open_tab(&target);
+                    }
+                },
+            );
+        } else {
+            let target = path.clone();
+            let owner = Rc::downgrade(state);
+            menu_action(&menu, tr!("Abrir com…", "Open With…"), move || {
+                if let Some(owner) = owner.upgrade() {
+                    owner.open_with(&target);
+                }
+            });
+        }
+    }
+    if selected.is_empty()
+        || selected
+            .as_slice()
+            .first()
+            .is_some_and(|path| selected.len() == 1 && path.is_dir())
+    {
+        let directory = selected
+            .first()
+            .cloned()
+            .unwrap_or_else(|| state.folder.borrow().clone());
+        let owner = Rc::downgrade(state);
+        menu_action(
+            &menu,
+            tr!("Abrir terminal aqui", "Open Terminal Here"),
+            move || {
+                if let Err(error) = commands::terminal(&directory) {
+                    if let Some(owner) = owner.upgrade() {
+                        owner.status.set_text(&error.to_string());
+                    }
+                }
+            },
+        );
+    }
+    let commands = [
+        ("new-folder", tr!("Nova pasta", "New Folder")),
+        ("paste", tr!("Colar", "Paste")),
+        (
+            "empty-file",
+            tr!("Criar arquivo vazio", "Create Empty File"),
+        ),
+        ("copy", tr!("Copiar", "Copy")),
+        ("cut", tr!("Recortar", "Cut")),
+        ("rename", tr!("Renomear", "Rename")),
+        ("trash", tr!("Mover para a lixeira", "Move to Trash")),
+    ];
+    for (name, label) in commands {
+        let enabled = match name {
+            "new-folder" | "paste" | "empty-file" => true,
+            "rename" => selected.len() == 1,
+            _ => !selected.is_empty(),
+        };
+        if enabled {
+            let owner = Rc::downgrade(state);
+            menu_action(&menu, label, move || {
+                if let Some(owner) = owner.upgrade() {
+                    owner.dispatch(name);
+                }
+            });
+        }
+    }
+    if !selected.is_empty() {
+        let owner = Rc::downgrade(state);
+        menu_action(
+            &menu,
+            tr!("Excluir permanentemente…", "Delete Permanently…"),
+            move || {
+                if let Some(owner) = owner.upgrade() {
+                    owner.dispatch("delete");
+                }
+            },
+        );
+    } else {
+        let owner = Rc::downgrade(state);
+        menu_action(&menu, tr!("Recarregar", "Reload"), move || {
+            if let Some(owner) = owner.upgrade() {
+                owner.dispatch("reload");
+            }
+        });
+    }
+    show_menu(&menu, event);
 }
 
 fn transfer_item(source: &Path, directory: &Path, moving: bool) -> Result<(), glib::Error> {
@@ -1053,7 +1545,8 @@ fn main() -> glib::ExitCode {
         window.set_title("Alpha File Manager");
         window.set_default_size(1120, 680);
         let header = gtk::HeaderBar::new();
-        header.set_title(Some("Alpha File Manager"));
+        // The app name lives in the window title; the header shows where you are.
+        header.set_title(Some(tr!("Início", "Home")));
         header.style_context().add_class("glass-toolbar");
         let toggle_sidebar = gtk::ToggleButton::new();
         toggle_sidebar.add(&gtk::Image::from_icon_name(
@@ -1067,6 +1560,7 @@ fn main() -> glib::ExitCode {
         toggle_sidebar.set_active(true);
         header.pack_start(&toggle_sidebar);
         let new_tab = icon_button("list-add-symbolic", tr!("Nova aba", "New Tab"));
+        new_tab.style_context().add_class("suggested-action");
         header.pack_end(&new_tab);
         let settings = icon_button("emblem-system-symbolic", tr!("Configurações", "Settings"));
         header.pack_end(&settings);
@@ -1179,8 +1673,16 @@ fn main() -> glib::ExitCode {
         });
         let home_control = home.downgrade();
         let files_control = files.downgrade();
+        let header_control = header.downgrade();
         let update_rail = move |stack: &gtk::Stack| {
             let active = stack.visible_child_name();
+            if let Some(header) = header_control.upgrade() {
+                header.set_title(Some(if active.as_deref() == Some("files") {
+                    tr!("Arquivos", "Files")
+                } else {
+                    tr!("Início", "Home")
+                }));
+            }
             for (name, control) in [("home", &home_control), ("files", &files_control)] {
                 if let Some(button) = control.upgrade() {
                     if active.as_deref() == Some(name) {
@@ -1613,5 +2115,89 @@ fn image_thumbnail(path: &Path) -> Option<gtk::gdk_pixbuf::Pixbuf> {
     if width <= 0 || height <= 0 || i64::from(width) * i64::from(height) > 20_000_000 {
         return None;
     }
-    gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, 32, 32, true).ok()
+    gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, THUMBNAIL, THUMBNAIL, true).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn scratch(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|time| time.as_nanos())
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("alpha-fm-{name}-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn names(rows: &[Entry]) -> Vec<&str> {
+        rows.iter().map(|entry| entry.name.as_str()).collect()
+    }
+
+    #[test]
+    fn folders_come_first_and_names_sort_case_insensitively() {
+        let dir = scratch("order");
+        fs::write(dir.join("beta.txt"), b"b").unwrap();
+        fs::write(dir.join("Alpha.txt"), b"a").unwrap();
+        fs::create_dir(dir.join("zeta")).unwrap();
+        let (mut rows, unreadable) = scan(&dir).unwrap();
+        assert_eq!(unreadable, 0);
+        sort_rows(&mut rows, 1, false);
+        assert_eq!(names(&rows), ["zeta", "Alpha.txt", "beta.txt"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn size_sort_descending_keeps_folders_first() {
+        let dir = scratch("size");
+        fs::write(dir.join("small"), vec![0u8; 10]).unwrap();
+        fs::write(dir.join("large"), vec![0u8; 5000]).unwrap();
+        fs::create_dir(dir.join("folder")).unwrap();
+        let (mut rows, _) = scan(&dir).unwrap();
+        sort_rows(&mut rows, 3, true);
+        assert_eq!(names(&rows), ["folder", "large", "small"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hidden_entries_are_flagged_not_dropped() {
+        let dir = scratch("hidden");
+        fs::write(dir.join(".secret"), b"x").unwrap();
+        fs::write(dir.join("visible"), b"x").unwrap();
+        let (rows, _) = scan(&dir).unwrap();
+        let hidden: Vec<bool> = rows.iter().map(|entry| entry.hidden).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(hidden.iter().filter(|flag| **flag).count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_folder_reports_an_error() {
+        assert!(scan(Path::new("/definitely/not/a/real/folder")).is_err());
+    }
+
+    /// Performance guard: a 10k-entry folder must scan and sort well within budget.
+    /// The budget is deliberately loose so slow CI machines do not flake; a real
+    /// regression (for example, going back to quadratic behaviour) blows far past it.
+    #[test]
+    fn large_folder_scans_and_sorts_within_budget() {
+        let dir = scratch("perf");
+        for index in 0..10_000 {
+            fs::write(dir.join(format!("file_{index:05}.txt")), b"x").unwrap();
+        }
+        let started = Instant::now();
+        let (mut rows, _) = scan(&dir).unwrap();
+        sort_rows(&mut rows, 1, false);
+        let elapsed = started.elapsed();
+        assert_eq!(rows.len(), 10_000);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "scan+sort of 10k entries took {elapsed:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

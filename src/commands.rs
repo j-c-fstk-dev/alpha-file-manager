@@ -1,4 +1,4 @@
-use crate::{Browser, Navigation};
+use crate::{Browser, Navigation, ICON_WIDTH};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use std::{
@@ -21,6 +21,7 @@ pub fn register(browser: &Rc<Browser>) {
     });
     for widget in [
         browser.view.clone().upcast::<gtk::Widget>(),
+        browser.icons.clone().upcast::<gtk::Widget>(),
         browser.address.clone().upcast(),
         browser.filter.clone().upcast(),
     ] {
@@ -578,7 +579,7 @@ impl Browser {
                 self.filter.grab_focus();
                 self.filter.select_region(0, -1);
             }
-            "select-all" => self.view.selection().select_all(),
+            "select-all" => self.select_all_rows(),
             "select-pattern" => self.select_pattern(),
             "copy-path" => {
                 let paths = self.selected();
@@ -615,6 +616,7 @@ impl Browser {
                     _ => 13,
                 };
                 self.zoom.set(size);
+                self.icons.set_item_width(ICON_WIDTH * size / 13);
                 for column in self.view.columns() {
                     for renderer in column
                         .cells()
@@ -625,18 +627,23 @@ impl Browser {
                     }
                 }
                 self.view.queue_resize();
+                self.icons.queue_resize();
             }
             "delete" => self.delete_selected(),
             "invert" => {
-                let selection = self.view.selection();
-                self.store.foreach(|_, path, _| {
-                    if selection.path_is_selected(path) {
-                        selection.unselect_path(path);
-                    } else {
-                        selection.select_path(path);
-                    }
+                // Visible rows only: the filtered model is what the user sees.
+                let mut rows = Vec::new();
+                self.filtered().foreach(|_, path, _| {
+                    rows.push(path.clone());
                     false
                 });
+                for row in rows {
+                    if self.row_selected(&row) {
+                        self.unselect_row(&row);
+                    } else {
+                        self.select_row(&row);
+                    }
+                }
             }
             "empty-file" => {
                 if let Some(name) =
@@ -690,16 +697,19 @@ impl Browser {
         }
         let filter = gtk::FileFilter::new();
         filter.add_pattern(&pattern);
-        let selection = self.view.selection();
-        selection.unselect_all();
-        self.store.foreach(|model, row, iter| {
+        self.unselect_all_rows();
+        let mut matches = Vec::new();
+        self.filtered().foreach(|model, row, iter| {
             if let Ok(name) = model.value(iter, 1).get::<String>() {
                 if filter.filter(&gtk::FileFilterInfo::new(None, None, Some(&name), None)) {
-                    selection.select_path(row);
+                    matches.push(row.clone());
                 }
             }
             false
         });
+        for row in matches {
+            self.select_row(&row);
+        }
     }
 
     fn delete_selected(self: &Rc<Self>) {
