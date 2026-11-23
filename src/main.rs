@@ -1,11 +1,14 @@
+#[macro_use]
+mod i18n;
 mod banner;
+mod commands;
 mod preferences;
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -25,12 +28,17 @@ struct Browser {
     store: gtk::ListStore,
     paths: Rc<RefCell<Vec<PathBuf>>>,
     history: Rc<RefCell<Vec<PathBuf>>>,
+    forward: RefCell<Vec<PathBuf>>,
+    commands: RefCell<HashMap<&'static str, gtk::Button>>,
+    transfer: Rc<RefCell<Transfer>>,
     folder: Rc<RefCell<PathBuf>>,
     address: gtk::Entry,
     filter: gtk::SearchEntry,
     hidden: gtk::ToggleButton,
     status: gtk::Label,
     sort: Cell<(i32, bool)>,
+    zoom: Cell<i32>,
+    focus_stamp: Cell<u64>,
     thumbnails: RefCell<VecDeque<i32>>,
     thumbnail_pending: Cell<bool>,
 }
@@ -40,29 +48,34 @@ impl Browser {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
         root.set_border_width(10);
         let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-        let back = icon_button("go-previous-symbolic", "Voltar");
-        let up = icon_button("go-up-symbolic", "Pasta superior");
+        let back = icon_button("go-previous-symbolic", tr!("Voltar", "Back"));
+        let forward = icon_button("go-next-symbolic", tr!("Avançar", "Forward"));
+        let up = icon_button("go-up-symbolic", tr!("Pasta superior", "Parent Folder"));
         let address = gtk::Entry::new();
         toolbar.pack_start(&back, false, false, 0);
+        toolbar.pack_start(&forward, false, false, 0);
         toolbar.pack_start(&up, false, false, 0);
         toolbar.pack_start(&address, true, true, 0);
         root.pack_start(&toolbar, false, false, 0);
 
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         let filter = gtk::SearchEntry::new();
-        filter.set_placeholder_text(Some("Filtrar nesta pasta"));
+        filter.set_placeholder_text(Some(tr!("Filtrar nesta pasta", "Filter this Folder")));
         let hidden = gtk::ToggleButton::new();
         hidden.add(&gtk::Image::from_icon_name(
             Some("view-reveal-symbolic"),
             gtk::IconSize::Button,
         ));
-        label_control(&hidden, "Mostrar arquivos ocultos");
-        let create = icon_button("folder-new-symbolic", "Nova pasta");
-        let rename = icon_button("document-edit-symbolic", "Renomear");
-        let trash = icon_button("user-trash-symbolic", "Lixeira");
-        let copy = icon_button("edit-copy-symbolic", "Copiar");
-        let cut = icon_button("edit-cut-symbolic", "Recortar");
-        let paste = icon_button("edit-paste-symbolic", "Colar");
+        label_control(
+            &hidden,
+            tr!("Mostrar arquivos ocultos", "Show Hidden Files"),
+        );
+        let create = icon_button("folder-new-symbolic", tr!("Nova pasta", "New Folder"));
+        let rename = icon_button("document-edit-symbolic", tr!("Renomear", "Rename"));
+        let trash = icon_button("user-trash-symbolic", tr!("Lixeira", "Trash"));
+        let copy = icon_button("edit-copy-symbolic", tr!("Copiar", "Copy"));
+        let cut = icon_button("edit-cut-symbolic", tr!("Recortar", "Cut"));
+        let paste = icon_button("edit-paste-symbolic", tr!("Colar", "Paste"));
         actions.pack_start(&filter, true, true, 0);
         for button in [
             hidden.upcast_ref(),
@@ -90,11 +103,11 @@ impl Browser {
         let view = gtk::TreeView::with_model(&store);
         view.selection().set_mode(gtk::SelectionMode::Multiple);
         for (index, name) in [
-            (1, "Nome"),
-            (2, "Tipo"),
-            (3, "Tamanho"),
-            (5, "Criação"),
-            (6, "Modificação"),
+            (1, tr!("Nome", "Name")),
+            (2, tr!("Tipo", "Type")),
+            (3, tr!("Tamanho", "Size")),
+            (5, tr!("Criação", "Created")),
+            (6, tr!("Modificação", "Modified")),
         ] {
             let column = gtk::TreeViewColumn::new();
             let renderer = gtk::CellRendererText::new();
@@ -155,12 +168,17 @@ impl Browser {
             store,
             paths: Default::default(),
             history: Default::default(),
+            forward: Default::default(),
+            commands: Default::default(),
+            transfer: transfer.clone(),
             folder: Rc::new(RefCell::new(path.to_owned())),
             address,
             filter,
             hidden,
             status,
             sort: Cell::new((1, false)),
+            zoom: Cell::new(13),
+            focus_stamp: Cell::default(),
             thumbnails: Default::default(),
             thumbnail_pending: Cell::new(false),
         });
@@ -216,8 +234,26 @@ impl Browser {
             };
             let previous = state.history.borrow_mut().pop();
             if let Some(path) = previous {
-                if !state.navigate(&path, false) {
+                let current = state.folder.borrow().clone();
+                if state.navigate(&path, false) {
+                    state.forward.borrow_mut().push(current);
+                } else {
                     state.history.borrow_mut().push(path);
+                }
+            }
+        });
+        let state = Rc::downgrade(&browser);
+        forward.connect_clicked(move |_| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let next = state.forward.borrow_mut().pop();
+            if let Some(path) = next {
+                let current = state.folder.borrow().clone();
+                if state.navigate(&path, false) {
+                    state.history.borrow_mut().push(current);
+                } else {
+                    state.forward.borrow_mut().push(path);
                 }
             }
         });
@@ -270,7 +306,7 @@ impl Browser {
             let Some(state) = state.upgrade() else {
                 return;
             };
-            if let Some(name) = state.ask_name("Nova pasta", "") {
+            if let Some(name) = state.ask_name(tr!("Nova pasta", "New Folder"), "") {
                 state.finish(fs::create_dir(state.folder.borrow().join(name)));
             }
         });
@@ -281,13 +317,18 @@ impl Browser {
             };
             let files = state.selected();
             let [source] = files.as_slice() else {
-                state.status.set_text("Selecione um item para renomear.");
+                state.status.set_text(tr!(
+                    "Selecione um item para renomear.",
+                    "Select one item to rename."
+                ));
                 return;
             };
             let Some(old_name) = source.file_name() else {
                 return;
             };
-            if let Some(name) = state.ask_name("Renomear", &old_name.to_string_lossy()) {
+            if let Some(name) =
+                state.ask_name(tr!("Renomear", "Rename"), &old_name.to_string_lossy())
+            {
                 let target = source.with_file_name(name);
                 if target == *source {
                     return;
@@ -314,7 +355,11 @@ impl Browser {
                 gtk::DialogFlags::MODAL,
                 gtk::MessageType::Question,
                 gtk::ButtonsType::OkCancel,
-                &format!("Mover {} item(ns) para a lixeira?", files.len()),
+                &trf!(
+                    "Mover {} item(ns) para a lixeira?",
+                    "Move {} item(s) to Trash?",
+                    files.len()
+                ),
             );
             let response = dialog.run();
             dialog.close();
@@ -336,9 +381,11 @@ impl Browser {
                 if paths.is_empty() {
                     return;
                 }
-                state
-                    .status
-                    .set_text(&format!("{} itens selecionados para colar", paths.len()));
+                state.status.set_text(&trf!(
+                    "{} itens selecionados para colar",
+                    "{} items selected for pasting",
+                    paths.len()
+                ));
                 transfer.replace(Transfer { paths, moving });
             });
         }
@@ -365,31 +412,26 @@ impl Browser {
             }
             state.refresh();
             if let Some(error) = errors.first() {
-                state
-                    .status
-                    .set_text(&format!("{} falha(s) · {error}", errors.len()));
+                state.status.set_text(&trf!(
+                    "{} falha(s) · {error}",
+                    "{} failure(s) · {error}",
+                    errors.len()
+                ));
             }
         });
+        browser.commands.replace(HashMap::from([
+            ("back", back),
+            ("forward", forward),
+            ("up", up),
+            ("new-folder", create),
+            ("copy", copy),
+            ("cut", cut),
+            ("paste", paste),
+            ("rename", rename),
+            ("trash", trash),
+        ]));
+        commands::register(&browser);
         let state = Rc::downgrade(&browser);
-        browser.view.connect_key_press_event(move |_, event| {
-            let Some(state) = state.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-            if event.keyval() == gdk::keys::constants::F5 {
-                state.refresh();
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-        let state = Rc::downgrade(&browser);
-        let commands = [
-            ("Nova pasta", create),
-            ("Copiar", copy),
-            ("Recortar", cut),
-            ("Colar", paste),
-            ("Renomear", rename),
-            ("Mover para a lixeira", trash),
-        ];
         browser.view.connect_button_press_event(move |view, event| {
             if event.button() != 3 || event.window() != view.bin_window() {
                 return glib::Propagation::Proceed;
@@ -415,19 +457,19 @@ impl Browser {
             if let [path] = selected.as_slice() {
                 let target = path.clone();
                 let owner = Rc::downgrade(&state);
-                menu_action(&menu, "Abrir", move || {
+                menu_action(&menu, tr!("Abrir", "Open"), move || {
                     if let Some(owner) = owner.upgrade() {
                         owner.open(&target);
                     }
                 });
                 let target = path.clone();
-                menu_action(&menu, "Copiar caminho", move || {
+                menu_action(&menu, tr!("Copiar caminho", "Copy Path"), move || {
                     gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD)
                         .set_text(&target.to_string_lossy());
                 });
                 let target = path.clone();
                 let owner = Rc::downgrade(&state);
-                menu_action(&menu, "Propriedades", move || {
+                menu_action(&menu, tr!("Propriedades", "Properties"), move || {
                     if let Some(owner) = owner.upgrade() {
                         owner.properties(&target);
                     }
@@ -440,29 +482,141 @@ impl Browser {
             };
             if let Some(path) = folder_to_pin {
                 let owner = Rc::downgrade(&state);
-                menu_action(&menu, "Fixar pasta no início e na lateral", move || {
-                    if let Err(error) = preferences::pin(&path) {
-                        if let Some(owner) = owner.upgrade() {
-                            owner.status.set_text(&error.to_string());
+                menu_action(
+                    &menu,
+                    tr!(
+                        "Fixar pasta no início e na lateral",
+                        "Pin Folder to Home and Sidebar"
+                    ),
+                    move || {
+                        if let Err(error) = preferences::pin(&path) {
+                            if let Some(owner) = owner.upgrade() {
+                                owner.status.set_text(&error.to_string());
+                            }
                         }
-                    }
-                });
+                    },
+                );
             }
-            for (index, (label, button)) in commands.iter().enumerate() {
-                let enabled = match index {
-                    0 | 3 => true,
-                    4 => selected.len() == 1,
+            if let [path] = selected.as_slice() {
+                if path.is_dir() {
+                    let target = path.clone();
+                    let owner = Rc::downgrade(&state);
+                    menu_action(
+                        &menu,
+                        tr!("Abrir em nova janela", "Open in New Window"),
+                        move || {
+                            if let Err(error) = commands::new_window(&target) {
+                                if let Some(owner) = owner.upgrade() {
+                                    owner.status.set_text(&error.to_string());
+                                }
+                            }
+                        },
+                    );
+                    let target = path.clone();
+                    let owner = Rc::downgrade(&state);
+                    menu_action(
+                        &menu,
+                        tr!("Abrir em nova aba", "Open in New Tab"),
+                        move || {
+                            if let Some(owner) = owner.upgrade() {
+                                owner.open_tab(&target);
+                            }
+                        },
+                    );
+                } else {
+                    let target = path.clone();
+                    let owner = Rc::downgrade(&state);
+                    menu_action(&menu, tr!("Abrir com…", "Open With…"), move || {
+                        if let Some(owner) = owner.upgrade() {
+                            owner.open_with(&target);
+                        }
+                    });
+                }
+            }
+            if selected.is_empty()
+                || selected
+                    .as_slice()
+                    .first()
+                    .is_some_and(|path| selected.len() == 1 && path.is_dir())
+            {
+                let directory = selected
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| state.folder.borrow().clone());
+                let owner = Rc::downgrade(&state);
+                menu_action(
+                    &menu,
+                    tr!("Abrir terminal aqui", "Open Terminal Here"),
+                    move || {
+                        if let Err(error) = commands::terminal(&directory) {
+                            if let Some(owner) = owner.upgrade() {
+                                owner.status.set_text(&error.to_string());
+                            }
+                        }
+                    },
+                );
+            }
+            let commands = [
+                ("new-folder", tr!("Nova pasta", "New Folder")),
+                ("paste", tr!("Colar", "Paste")),
+                (
+                    "empty-file",
+                    tr!("Criar arquivo vazio", "Create Empty File"),
+                ),
+                ("copy", tr!("Copiar", "Copy")),
+                ("cut", tr!("Recortar", "Cut")),
+                ("rename", tr!("Renomear", "Rename")),
+                ("trash", tr!("Mover para a lixeira", "Move to Trash")),
+            ];
+            for (name, label) in commands {
+                let enabled = match name {
+                    "new-folder" | "paste" | "empty-file" => true,
+                    "rename" => selected.len() == 1,
                     _ => !selected.is_empty(),
                 };
                 if enabled {
-                    let button = button.clone();
-                    menu_action(&menu, label, move || button.clicked());
+                    let owner = Rc::downgrade(&state);
+                    menu_action(&menu, label, move || {
+                        if let Some(owner) = owner.upgrade() {
+                            owner.dispatch(name);
+                        }
+                    });
                 }
+            }
+            if !selected.is_empty() {
+                let owner = Rc::downgrade(&state);
+                menu_action(
+                    &menu,
+                    tr!("Excluir permanentemente…", "Delete Permanently…"),
+                    move || {
+                        if let Some(owner) = owner.upgrade() {
+                            owner.dispatch("delete");
+                        }
+                    },
+                );
+            } else {
+                let owner = Rc::downgrade(&state);
+                menu_action(&menu, tr!("Recarregar", "Reload"), move || {
+                    if let Some(owner) = owner.upgrade() {
+                        owner.dispatch("reload");
+                    }
+                });
             }
             show_menu(&menu, event);
             glib::Propagation::Stop
         });
         (browser, root)
+    }
+
+    fn open_tab(&self, path: &Path) {
+        if let Some(tabs) = self
+            .root
+            .upgrade()
+            .and_then(|root| root.ancestor(gtk::Notebook::static_type()))
+            .and_then(|widget| widget.downcast::<gtk::Notebook>().ok())
+        {
+            open_tab(&tabs, path, self.transfer.clone());
+        }
     }
 
     fn open(self: &Rc<Self>, path: &Path) {
@@ -487,8 +641,9 @@ impl Browser {
             }
         };
         let (kind, _) = file_display(path, metadata.is_dir(), metadata.is_symlink());
-        let message = format!(
+        let message = trf!(
             "{}\n\nTipo  {kind}\nTamanho  {} bytes\nCriação  {}\nModificação  {}",
+            "{}\n\nType  {kind}\nSize  {} bytes\nCreated  {}\nModified  {}",
             path.display(),
             metadata.len(),
             display_date(metadata.created().ok()),
@@ -501,7 +656,7 @@ impl Browser {
             gtk::ButtonsType::Close,
             &message,
         );
-        dialog.set_title("Propriedades");
+        dialog.set_title(tr!("Propriedades", "Properties"));
         dialog.run();
         dialog.close();
     }
@@ -541,7 +696,7 @@ impl Browser {
             let Some(iter) = self.store.iter_nth_child(None, index) else {
                 continue;
             };
-            if self.store.value(&iter, 2).get::<String>().as_deref() != Ok("Imagem") {
+            if self.store.value(&iter, 2).get::<String>().as_deref() != Ok(tr!("Imagem", "Image")) {
                 continue;
             }
             let Some(path) = paths.get(index as usize) else {
@@ -581,8 +736,8 @@ impl Browser {
             self.window().as_ref(),
             gtk::DialogFlags::MODAL,
             &[
-                ("Cancelar", gtk::ResponseType::Cancel),
-                ("Salvar", gtk::ResponseType::Ok),
+                (tr!("Cancelar", "Cancel"), gtk::ResponseType::Cancel),
+                (tr!("Salvar", "Save"), gtk::ResponseType::Ok),
             ],
         );
         dialog.set_default_response(gtk::ResponseType::Ok);
@@ -598,7 +753,10 @@ impl Browser {
             return None;
         }
         if name.is_empty() || name.contains('/') || matches!(name.as_str(), "." | "..") {
-            self.status.set_text("Digite um nome válido para o item.");
+            self.status.set_text(tr!(
+                "Digite um nome válido para o item.",
+                "Enter a valid item name."
+            ));
             return None;
         }
         Some(OsString::from(name.as_str()))
@@ -641,6 +799,7 @@ impl Browser {
         let old = self.folder.replace(path.clone());
         if remember && old != path {
             self.history.borrow_mut().push(old);
+            self.forward.borrow_mut().clear();
         }
         self.address.set_text(&path.to_string_lossy());
         self.filter.set_text("");
@@ -729,9 +888,13 @@ impl Browser {
             );
         }
         self.status.set_text(&if unreadable == 0 {
-            format!("{} itens", paths.len())
+            trf!("{} itens", "{} items", paths.len())
         } else {
-            format!("{} itens · {unreadable} entradas ilegíveis", paths.len())
+            trf!(
+                "{} itens · {unreadable} entradas ilegíveis",
+                "{} items · {unreadable} unreadable entries",
+                paths.len()
+            )
         });
         self.queue_thumbnails();
     }
@@ -739,13 +902,21 @@ impl Browser {
 
 fn transfer_item(source: &Path, directory: &Path, moving: bool) -> Result<(), glib::Error> {
     let reject = |message| glib::Error::new(gio::IOErrorEnum::InvalidArgument, message);
-    let name = source.file_name().ok_or_else(|| reject("Nome inválido"))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| reject(tr!("Nome inválido", "Invalid name")))?;
     if directory.starts_with(source) {
-        return Err(reject("O destino está dentro da origem"));
+        return Err(reject(tr!(
+            "O destino está dentro da origem",
+            "The destination is inside the source"
+        )));
     }
     let target = directory.join(name);
     if source == target {
-        return Err(reject("Origem e destino são iguais"));
+        return Err(reject(tr!(
+            "Origem e destino são iguais",
+            "Source and destination are the same"
+        )));
     }
     let source_file = gio::File::for_path(source);
     let target_file = gio::File::for_path(target);
@@ -801,14 +972,14 @@ fn open_tab(tabs: &gtk::Notebook, path: &Path, transfer: Rc<RefCell<Transfer>>) 
     let tools = gtk::Box::new(gtk::Orientation::Horizontal, 5);
     tools.set_border_width(8);
     tools.style_context().add_class("tab-actions");
-    let split = gtk::ToggleButton::with_label("Painel duplo");
+    let split = gtk::ToggleButton::with_label(tr!("Painel duplo", "Split View"));
     tools.pack_end(&split, false, false, 0);
     page.pack_start(&tools, false, false, 0);
     let panes = gtk::Paned::new(gtk::Orientation::Horizontal);
     let (first, first_root) = Browser::new(path, transfer.clone());
     panes.pack1(&first_root, true, false);
     page.pack_start(&panes, true, true, 0);
-    let label = gtk::Label::new(Some("Arquivos"));
+    let label = gtk::Label::new(Some(tr!("Arquivos", "Files")));
     let tab_label = label.clone();
     first.address.connect_changed(move |entry| {
         let text = entry.text();
@@ -834,7 +1005,7 @@ fn open_tab(tabs: &gtk::Notebook, path: &Path, transfer: Rc<RefCell<Transfer>>) 
         }
     });
     let tab = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let close = icon_button("window-close-symbolic", "Fechar aba");
+    let close = icon_button("window-close-symbolic", tr!("Fechar aba", "Close Tab"));
     close.style_context().add_class("tab-close");
     tab.pack_start(&label, true, true, 0);
     tab.pack_end(&close, false, false, 0);
@@ -889,12 +1060,15 @@ fn main() -> glib::ExitCode {
             Some("sidebar-show-symbolic"),
             gtk::IconSize::Button,
         ));
-        label_control(&toggle_sidebar, "Mostrar barra lateral");
+        label_control(
+            &toggle_sidebar,
+            tr!("Mostrar barra lateral", "Show Sidebar"),
+        );
         toggle_sidebar.set_active(true);
         header.pack_start(&toggle_sidebar);
-        let new_tab = icon_button("list-add-symbolic", "Nova aba");
+        let new_tab = icon_button("list-add-symbolic", tr!("Nova aba", "New Tab"));
         header.pack_end(&new_tab);
-        let settings = icon_button("emblem-system-symbolic", "Configurações");
+        let settings = icon_button("emblem-system-symbolic", tr!("Configurações", "Settings"));
         header.pack_end(&settings);
         let owner = window.downgrade();
         settings.connect_clicked(move |_| {
@@ -923,8 +1097,8 @@ fn main() -> glib::ExitCode {
         brand_row.set_halign(gtk::Align::Center);
         brand_row.pack_start(&brand, false, false, 0);
         sidebar_column.pack_start(&brand_row, false, false, 0);
-        let home = location_button("go-home-symbolic", "Início", true);
-        let files = location_button("folder-symbolic", "Arquivos", true);
+        let home = location_button("go-home-symbolic", tr!("Início", "Home"), true);
+        let files = location_button("folder-symbolic", tr!("Arquivos", "Files"), true);
         rail.pack_start(&home, false, false, 0);
         rail.pack_start(&files, false, false, 0);
         let sidebar = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
@@ -946,13 +1120,16 @@ fn main() -> glib::ExitCode {
             label_control(
                 toggle,
                 if toggle.is_active() {
-                    "Recolher barra lateral"
+                    tr!("Recolher barra lateral", "Collapse Sidebar")
                 } else {
-                    "Expandir barra lateral"
+                    tr!("Expandir barra lateral", "Expand Sidebar")
                 },
             );
         });
-        label_control(&toggle_sidebar, "Recolher barra lateral");
+        label_control(
+            &toggle_sidebar,
+            tr!("Recolher barra lateral", "Collapse Sidebar"),
+        );
 
         let stack = gtk::Stack::new();
         let tabs = gtk::Notebook::new();
@@ -963,6 +1140,7 @@ fn main() -> glib::ExitCode {
             tabs: tabs.downgrade(),
             transfer: transfer.clone(),
         };
+        commands::install(&window, app, &header, &navigation, &toggle_sidebar);
         add_sidebar_locations(&rail, &navigation);
         let dashboard = dashboard(&navigation);
         stack.add_named(&dashboard, "home");
@@ -1063,7 +1241,7 @@ fn file_display(path: &Path, directory: bool, link: bool) -> (&'static str, &'st
         return ("Link", "emblem-symbolic-link");
     }
     if directory {
-        return ("Pasta", "folder");
+        return (tr!("Pasta", "Folder"), "folder");
     }
 
     let extension = path
@@ -1072,21 +1250,31 @@ fn file_display(path: &Path, directory: bool, link: bool) -> (&'static str, &'st
         .unwrap_or("");
     match extension.to_ascii_lowercase().as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "avif" | "bmp" | "tif" | "ico" => {
-            ("Imagem", "image-x-generic")
+            (tr!("Imagem", "Image"), "image-x-generic")
         }
-        "mp4" | "mkv" | "webm" | "avi" | "mov" | "m4v" => ("Vídeo", "video-x-generic"),
-        "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a" | "aac" => ("Áudio", "audio-x-generic"),
+        "mp4" | "mkv" | "webm" | "avi" | "mov" | "m4v" => {
+            (tr!("Vídeo", "Video"), "video-x-generic")
+        }
+        "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a" | "aac" => {
+            (tr!("Áudio", "Audio"), "audio-x-generic")
+        }
         "pdf" => ("PDF", "application-pdf"),
         "zip" | "tar" | "gz" | "xz" | "bz2" | "7z" | "rar" | "zst" => {
-            ("Compactado", "package-x-generic")
+            (tr!("Compactado", "Archive"), "package-x-generic")
         }
         "rs" | "py" | "js" | "ts" | "cpp" | "c" | "h" | "go" | "java" | "sh" | "css" | "html"
-        | "json" | "toml" | "yaml" | "yml" | "xml" => ("Código", "text-x-script"),
-        "csv" | "ods" | "xls" | "xlsx" => ("Planilha", "x-office-spreadsheet"),
-        "odp" | "ppt" | "pptx" => ("Apresentação", "x-office-presentation"),
-        "txt" | "md" | "log" | "odt" | "rtf" | "doc" | "docx" => ("Documento", "x-office-document"),
-        "deb" | "rpm" | "appimage" => ("Aplicativo", "application-x-executable"),
-        _ => ("Arquivo", "text-x-generic"),
+        | "json" | "toml" | "yaml" | "yml" | "xml" => {
+            (tr!("Código", "Source Code"), "text-x-script")
+        }
+        "csv" | "ods" | "xls" | "xlsx" => (tr!("Planilha", "Spreadsheet"), "x-office-spreadsheet"),
+        "odp" | "ppt" | "pptx" => (tr!("Apresentação", "Presentation"), "x-office-presentation"),
+        "txt" | "md" | "log" | "odt" | "rtf" | "doc" | "docx" => {
+            (tr!("Documento", "Document"), "x-office-document")
+        }
+        "deb" | "rpm" | "appimage" => {
+            (tr!("Aplicativo", "Application"), "application-x-executable")
+        }
+        _ => (tr!("Arquivo", "File"), "text-x-generic"),
     }
 }
 
@@ -1108,14 +1296,22 @@ impl Navigation {
 
 fn standard_locations() -> Vec<(&'static str, &'static str, PathBuf)> {
     use glib::UserDirectory::*;
-    let mut folders = vec![("Pasta pessoal", "user-home", glib::home_dir())];
+    let mut folders = vec![(
+        tr!("Pasta pessoal", "Home Folder"),
+        "user-home",
+        glib::home_dir(),
+    )];
     for (name, icon, directory) in [
-        ("Área de trabalho", "user-desktop", Desktop),
+        (tr!("Área de trabalho", "Desktop"), "user-desktop", Desktop),
         ("Downloads", "folder-download", Downloads),
-        ("Documentos", "folder-documents", Documents),
-        ("Imagens", "folder-pictures", Pictures),
-        ("Vídeos", "folder-videos", Videos),
-        ("Música", "folder-music", Music),
+        (
+            tr!("Documentos", "Documents"),
+            "folder-documents",
+            Documents,
+        ),
+        (tr!("Imagens", "Images"), "folder-pictures", Pictures),
+        (tr!("Vídeos", "Videos"), "folder-videos", Videos),
+        (tr!("Música", "Music"), "folder-music", Music),
     ] {
         if let Some(path) = glib::user_special_dir(directory).filter(|path| path.is_dir()) {
             folders.push((name, icon, path));
@@ -1167,13 +1363,17 @@ fn location(
             let menu = gtk::Menu::new();
             let path = path.clone();
             let parent = button.downgrade();
-            menu_action(&menu, "Remover dos atalhos", move || {
-                if let Err(error) = preferences::unpin(&path) {
-                    if let Some(parent) = parent.upgrade() {
-                        show_error(&parent, &error.to_string());
+            menu_action(
+                &menu,
+                tr!("Remover dos atalhos", "Remove from Shortcuts"),
+                move || {
+                    if let Err(error) = preferences::unpin(&path) {
+                        if let Some(parent) = parent.upgrade() {
+                            show_error(&parent, &error.to_string());
+                        }
                     }
-                }
-            });
+                },
+            );
             show_menu(&menu, event);
             glib::Propagation::Stop
         });
@@ -1229,12 +1429,12 @@ fn section(name: &str) -> gtk::Label {
 }
 
 fn add_sidebar_locations(rail: &gtk::Box, navigation: &Navigation) {
-    rail.pack_start(&section("Pastas"), false, false, 4);
-    for (name, icon, path) in
-        standard_locations()
-            .into_iter()
-            .chain([("Sistema", "drive-harddisk", PathBuf::from("/"))])
-    {
+    rail.pack_start(&section(tr!("Pastas", "Folders")), false, false, 4);
+    for (name, icon, path) in standard_locations().into_iter().chain([(
+        tr!("Sistema", "System"),
+        "drive-harddisk",
+        PathBuf::from("/"),
+    )]) {
         rail.pack_start(
             &location(navigation, icon, name, path, true, false),
             false,
@@ -1242,7 +1442,7 @@ fn add_sidebar_locations(rail: &gtk::Box, navigation: &Navigation) {
             0,
         );
     }
-    rail.pack_start(&section("Fixados"), false, false, 4);
+    rail.pack_start(&section(tr!("Fixados", "Pinned")), false, false, 4);
     let pins = gtk::Box::new(gtk::Orientation::Vertical, 5);
     rail.pack_start(&pins, false, false, 0);
     pinned_locations(&pins, navigation, true);
@@ -1266,8 +1466,8 @@ fn dashboard(navigation: &Navigation) -> gtk::ScrolledWindow {
     content.pack_start(&banner::widget(), false, false, 0);
 
     let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    heading.pack_start(&section("Fixados"), true, true, 0);
-    let add = gtk::Button::with_label("Adicionar pasta");
+    heading.pack_start(&section(tr!("Fixados", "Pinned")), true, true, 0);
+    let add = gtk::Button::with_label(tr!("Adicionar pasta", "Add Folder"));
     heading.pack_end(&add, false, false, 0);
     content.pack_start(&heading, false, false, 0);
     add.connect_clicked(|button| {
@@ -1275,12 +1475,12 @@ fn dashboard(navigation: &Navigation) -> gtk::ScrolledWindow {
             .toplevel()
             .and_then(|widget| widget.downcast::<gtk::Window>().ok());
         let chooser = gtk::FileChooserDialog::with_buttons(
-            Some("Fixar uma pasta"),
+            Some(tr!("Fixar uma pasta", "Pin a Folder")),
             parent.as_ref(),
             gtk::FileChooserAction::SelectFolder,
             &[
-                ("Cancelar", gtk::ResponseType::Cancel),
-                ("Fixar", gtk::ResponseType::Accept),
+                (tr!("Cancelar", "Cancel"), gtk::ResponseType::Cancel),
+                (tr!("Fixar", "Pin"), gtk::ResponseType::Accept),
             ],
         );
         let chosen = if chooser.run() == gtk::ResponseType::Accept {
@@ -1301,10 +1501,17 @@ fn dashboard(navigation: &Navigation) -> gtk::ScrolledWindow {
     pinned_locations(&pinned, navigation, false);
 
     for (heading, locations) in [
-        ("Pastas pessoais", standard_locations()),
         (
-            "Sistema",
-            vec![("Sistema de arquivos", "drive-harddisk", PathBuf::from("/"))],
+            tr!("Pastas pessoais", "Personal Folders"),
+            standard_locations(),
+        ),
+        (
+            tr!("Sistema", "System"),
+            vec![(
+                tr!("Sistema de arquivos", "File System"),
+                "drive-harddisk",
+                PathBuf::from("/"),
+            )],
         ),
     ] {
         content.pack_start(&section(heading), false, false, 0);

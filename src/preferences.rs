@@ -8,12 +8,19 @@ use std::{
 
 pub const DESKTOP_ID: &str = "dev.jcdev.AlphaFileManager.desktop";
 pub const ICON: &str = "dev.jcdev.AlphaFileManager";
-const PROFILES: &[(&str, &str, &str, &str)] = &[
-    ("Verde fósforo", "#8df4ae", "#244936", "#121d19"),
-    ("Âmbar", "#ffc77a", "#584023", "#211a15"),
-    ("Ciano", "#80edff", "#234953", "#101d23"),
-    ("Violeta", "#d6baff", "#4a385f", "#1d1727"),
-];
+fn profiles() -> [(&'static str, &'static str, &'static str, &'static str); 4] {
+    [
+        (
+            tr!("Verde fósforo", "Phosphor Green"),
+            "#8df4ae",
+            "#244936",
+            "#121d19",
+        ),
+        (tr!("Âmbar", "Amber"), "#ffc77a", "#584023", "#211a15"),
+        (tr!("Ciano", "Cyan"), "#80edff", "#234953", "#101d23"),
+        (tr!("Violeta", "Violet"), "#d6baff", "#4a385f", "#1d1727"),
+    ]
+}
 
 fn directory() -> PathBuf {
     glib::user_config_dir().join("alpha-file-manager")
@@ -102,7 +109,7 @@ pub fn profile() -> u32 {
     fs::read_to_string(directory().join("profile"))
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|value| (*value as usize) < PROFILES.len())
+        .filter(|value| (*value as usize) < profiles().len())
         .unwrap_or_default()
 }
 
@@ -110,7 +117,15 @@ fn transparency() -> bool {
     fs::read_to_string(directory().join("transparency")).is_ok_and(|value| value.trim() == "true")
 }
 
-fn apply_transparency(window: &gtk::ApplicationWindow, enabled: bool) {
+fn opacity() -> u8 {
+    fs::read_to_string(directory().join("opacity"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|value| (60..=100).contains(value))
+        .unwrap_or(94)
+}
+
+fn apply_transparency(window: &gtk::ApplicationWindow, enabled: bool, opacity: u8) {
     let style = window.style_context();
     if enabled {
         style.add_class("translucent");
@@ -119,22 +134,26 @@ fn apply_transparency(window: &gtk::ApplicationWindow, enabled: bool) {
     }
     let composited =
         gtk::prelude::GtkWindowExt::screen(window).is_some_and(|screen| screen.is_composited());
-    window.set_opacity(if enabled && composited { 0.94 } else { 1.0 });
+    window.set_opacity(if enabled && composited {
+        f64::from(opacity) / 100.0
+    } else {
+        1.0
+    });
 }
 
 pub fn apply_theme(window: &gtk::ApplicationWindow, profile: u32) {
-    apply_transparency(window, transparency());
+    apply_transparency(window, transparency(), opacity());
     let Some(screen) = gtk::prelude::GtkWindowExt::screen(window) else {
         return;
     };
-    let (_, accent, selection, background) = PROFILES[profile as usize];
+    let (_, accent, selection, background) = profiles()[profile as usize];
     let data = format!(
         "@define-color phosphor {accent};\n@define-color phosphor_selection {selection};\n@define-color phosphor_bg {background};\n{}",
         include_str!("alpha.css")
     );
     let provider = gtk::CssProvider::new();
     if let Err(error) = provider.load_from_data(data.as_bytes()) {
-        eprintln!("Tema Alpha: {error}");
+        eprintln!("{}", trf!("Tema Alpha: {error}", "Alpha theme: {error}"));
         return;
     }
     THEME.with(|current| {
@@ -175,7 +194,10 @@ fn set_xfce_default() -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "Registro do Alpha no Xfce ausente.",
+            tr!(
+                "Registro do Alpha no Xfce ausente.",
+                "Alpha is not registered with Xfce."
+            ),
         ));
     }
     let file = xfce_preferences();
@@ -203,10 +225,10 @@ fn set_xfce_default() -> io::Result<()> {
 
 pub fn settings(window: &gtk::ApplicationWindow) {
     let dialog = gtk::Dialog::with_buttons(
-        Some("Configurações do Alpha"),
+        Some(tr!("Configurações do Alpha", "Alpha Settings")),
         Some(window),
         gtk::DialogFlags::MODAL,
-        &[("Fechar", gtk::ResponseType::Close)],
+        &[(tr!("Fechar", "Close"), gtk::ResponseType::Close)],
     );
     dialog.style_context().add_class("alpha");
     dialog.set_default_size(410, 200);
@@ -214,19 +236,34 @@ pub fn settings(window: &gtk::ApplicationWindow) {
     content.set_border_width(18);
     content.set_spacing(12);
     let colors = gtk::ComboBoxText::new();
-    for (name, ..) in PROFILES {
+    for (name, ..) in profiles() {
         colors.append_text(name);
     }
     colors.set_active(Some(profile()));
-    let label = gtk::Label::new(Some("Perfil de cores"));
+    let label = gtk::Label::new(Some(tr!("Perfil de cores", "Color Profile")));
     label.set_xalign(0.0);
     label.set_mnemonic_widget(Some(&colors));
     content.add(&label);
     content.add(&colors);
-    let glass = gtk::CheckButton::with_label("Ativar transparência");
+    let glass = gtk::CheckButton::with_label(tr!("Ativar transparência", "Enable Transparency"));
     glass.set_active(transparency());
     content.add(&glass);
-    let set_default = gtk::Button::with_label("Usar o Alpha como gerenciador padrão");
+    let opacity_label = gtk::Label::new(Some(tr!("Opacidade da janela", "Window Opacity")));
+    opacity_label.set_xalign(0.0);
+    let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 60.0, 100.0, 1.0);
+    slider.set_value(f64::from(opacity()));
+    slider.set_digits(0);
+    slider.connect_format_value(|_, value| format!("{value:.0}%"));
+    opacity_label.set_mnemonic_widget(Some(&slider));
+    let opacity_row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    opacity_row.add(&opacity_label);
+    opacity_row.add(&slider);
+    opacity_row.set_sensitive(glass.is_active());
+    content.add(&opacity_row);
+    let set_default = gtk::Button::with_label(tr!(
+        "Usar o Alpha como gerenciador padrão",
+        "Use Alpha as the Default File Manager"
+    ));
     let status = gtk::Label::new(None);
     status.set_xalign(0.0);
     status.set_line_wrap(true);
@@ -235,14 +272,20 @@ pub fn settings(window: &gtk::ApplicationWindow) {
         let is_default = active.as_ref().and_then(|app| app.id()).as_deref() == Some(DESKTOP_ID);
         let name = active
             .map(|info| info.display_name().to_string())
-            .unwrap_or_else(|| "Nenhum".into());
+            .unwrap_or_else(|| tr!("Nenhum", "None").into());
         let xfce_pending = runs_xfce() && !xfce_has_alpha();
         let suffix = if xfce_pending {
-            "\nO atalho de arquivos do Xfce ainda usa a preferência atual do desktop."
+            tr!(
+                "\nO atalho de arquivos do Xfce ainda usa a preferência atual do desktop.",
+                "\nThe Xfce file manager shortcut still uses the current desktop preference."
+            )
         } else {
             ""
         };
-        label.set_text(&format!("Aplicativo para abrir pastas — {name}{suffix}"));
+        label.set_text(&trf!(
+            "Aplicativo para abrir pastas — {name}{suffix}",
+            "Application for opening folders — {name}{suffix}"
+        ));
         is_default && !xfce_pending
     };
     set_default.set_sensitive(!update_status(&status));
@@ -263,25 +306,41 @@ pub fn settings(window: &gtk::ApplicationWindow) {
     glass.connect_toggled(move |toggle| {
         if let Some(window) = weak_window.upgrade() {
             let enabled = toggle.is_active();
+            opacity_row.set_sensitive(enabled);
             match write_setting("transparency", if enabled { "true" } else { "false" }) {
-                Ok(()) => apply_transparency(&window, enabled),
+                Ok(()) => apply_transparency(&window, enabled, opacity()),
                 Err(error) => result.set_text(&error.to_string()),
             }
         }
     });
+    let weak_window = window.downgrade();
+    let result = status.clone();
+    slider.connect_value_changed(move |slider| {
+        let value = slider.value().round() as u8;
+        match write_setting("opacity", &value.to_string()) {
+            Ok(()) => {
+                if let Some(window) = weak_window.upgrade() {
+                    apply_transparency(&window, true, value);
+                }
+            }
+            Err(error) => result.set_text(&error.to_string()),
+        }
+    });
     set_default.connect_clicked(move |button| {
         let Some(app) = gio::DesktopAppInfo::new(DESKTOP_ID) else {
-            status.set_text(
+            status.set_text(tr!(
                 "O lançador do Alpha precisa estar instalado para escolher o aplicativo padrão.",
-            );
+                "Install the Alpha launcher before choosing it as the default application."
+            ));
             return;
         };
         match app.set_as_default_for_type("inode/directory") {
             Ok(()) => {
                 if runs_xfce() {
                     if let Err(error) = set_xfce_default() {
-                        status.set_text(&format!(
-                            "Associação de pastas salva. Configuração do Xfce: {error}"
+                        status.set_text(&trf!(
+                            "Associação de pastas salva. Configuração do Xfce: {error}",
+                            "Folder association saved. Xfce setup: {error}"
                         ));
                         return;
                     }

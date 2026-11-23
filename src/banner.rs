@@ -75,7 +75,10 @@ pub fn widget() -> gtk::Overlay {
     title.set_margin_start(25);
     title.set_margin_bottom(24);
     overlay.add_overlay(&title);
-    let change = crate::icon_button("image-x-generic-symbolic", "Alterar imagem do banner");
+    let change = crate::icon_button(
+        "image-x-generic-symbolic",
+        tr!("Alterar imagem do banner", "Change Banner Image"),
+    );
     change.style_context().add_class("banner-control");
     change.set_halign(gtk::Align::End);
     change.set_valign(gtk::Align::Start);
@@ -87,17 +90,20 @@ pub fn widget() -> gtk::Overlay {
             .toplevel()
             .and_then(|widget| widget.downcast::<gtk::Window>().ok());
         let chooser = gtk::FileChooserDialog::with_buttons(
-            Some("Imagem do banner"),
+            Some(tr!("Imagem do banner", "Banner Image")),
             parent.as_ref(),
             gtk::FileChooserAction::Open,
             &[
-                ("Restaurar padrão", gtk::ResponseType::Other(1)),
-                ("Cancelar", gtk::ResponseType::Cancel),
-                ("Usar imagem", gtk::ResponseType::Accept),
+                (
+                    tr!("Restaurar padrão", "Restore Default"),
+                    gtk::ResponseType::Other(1),
+                ),
+                (tr!("Cancelar", "Cancel"), gtk::ResponseType::Cancel),
+                (tr!("Usar imagem", "Use Image"), gtk::ResponseType::Accept),
             ],
         );
         let filter = gtk::FileFilter::new();
-        filter.set_name(Some("Imagens"));
+        filter.set_name(Some(tr!("Imagens", "Images")));
         filter.add_pixbuf_formats();
         chooser.add_filter(filter);
         let response = chooser.run();
@@ -123,11 +129,20 @@ pub fn widget() -> gtk::Overlay {
 fn import_image(path: PathBuf) -> Result<Option<Pixbuf>, String> {
     let meta = fs::metadata(&path).map_err(|error| error.to_string())?;
     if !meta.is_file() || meta.len() > 30 * 1024 * 1024 {
-        return Err("Escolha um arquivo de imagem de até 30 MiB.".into());
+        return Err(tr!(
+            "Escolha um arquivo de imagem de até 30 MiB.",
+            "Choose an image no larger than 30 MiB."
+        )
+        .into());
     }
-    let (_, width, height) = Pixbuf::file_info(&path).ok_or("Formato de imagem inválido.")?;
+    let (_, width, height) = Pixbuf::file_info(&path)
+        .ok_or(tr!("Formato de imagem inválido.", "Invalid image format."))?;
     if width <= 0 || height <= 0 || i64::from(width) * i64::from(height) > 35_000_000 {
-        return Err("Escolha uma imagem de até 35 megapixels.".into());
+        return Err(tr!(
+            "Escolha uma imagem de até 35 megapixels.",
+            "Choose an image up to 35 megapixels."
+        )
+        .into());
     }
     let image =
         Pixbuf::from_file_at_scale(&path, 1920, 1080, true).map_err(|error| error.to_string())?;
