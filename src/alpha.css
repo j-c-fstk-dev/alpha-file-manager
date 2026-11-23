@@ -347,3 +347,32 @@ menu.alpha menuitem:hover { background-color: alpha(@phosphor, 0.22); }
     border: none;
     box-shadow: none;
 }
+
+/* Menu bar as quiet text tabs in the header */
+.alpha headerbar button.menu-tab {
+    min-height: 32px;
+    min-width: 0;
+    padding: 0 10px;
+    border-radius: 9px;
+    color: #a9bdb3;
+    font-size: 13.5px;
+    font-weight: 500;
+}
+.alpha headerbar button.menu-tab:hover { background-color: alpha(white, 0.06); color: #f2f8f4; }
+.alpha headerbar button.menu-tab:checked {
+    background-color: alpha(@phosphor, 0.14);
+    border-color: transparent;
+    color: @phosphor;
+}
+.alpha headerbar button.sidebar-toggle { margin-right: 6px; }
+
+/* Menu popovers */
+.alpha popover, popover.background {
+    background-color: #172326;
+    border: 1px solid alpha(white, 0.1);
+    border-radius: 12px;
+    box-shadow: 0 16px 36px alpha(black, 0.4);
+}
+.alpha popover modelbutton { border-radius: 8px; padding: 6px 10px; color: #edf5f0; }
+.alpha popover modelbutton:hover { background-color: alpha(@phosphor, 0.18); }
+.alpha popover accelerator { color: #8fa39b; }

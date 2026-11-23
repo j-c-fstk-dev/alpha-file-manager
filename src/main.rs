@@ -2259,7 +2259,9 @@ fn global_search(
         "Search or type a path…"
     )));
     entry.set_primary_icon_name(Some("system-search-symbolic"));
-    entry.set_width_chars(48);
+    // Narrow windows shrink the pill so menus, search and actions all fit.
+    entry.set_width_chars(22);
+    entry.set_max_width_chars(46);
     label_control(
         &entry,
         tr!("Buscar ou ir para um caminho", "Search or go to a path"),
