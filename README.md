@@ -11,7 +11,9 @@ A lightweight Linux file manager written in Rust with native GTK 3 widgets.
 - Tabs, split view, an address bar, and per-pane navigation history.
 - A collapsible sidebar with standard folders and pins shared with the home page.
 - A customizable panoramic banner and four color profiles, with optional window transparency.
-- Image thumbnails, file type icons, and sorting by name, type, size, or date.
+- List and icon views, image thumbnails, file type icons, and sorting by name, type, size, or date.
+- A header search field: type a path to open it, or text to filter the current folder.
+- Fast loading of large folders, read in the background without blocking the window.
 - Header and context menus for file operations, navigation, and view controls.
 - A per-user application launcher and default file manager integration for Xfce.
 - Automatic English and Portuguese localization based on the system language.
@@ -40,7 +42,7 @@ Run `./install-launcher.sh` to register the app for your account. Pass a directo
 
 ## Usage
 
-The header menus show available shortcuts. Use the context menu to access commands for the
+The header menus show available shortcuts. Press **Ctrl+K** to focus the search field. Use the context menu to access commands for the
 selected files or folder. To pin a folder, use **Add Folder** on the home page or **Pin Folder
 to Home and Sidebar** in its context menu. Right-click a pin to remove it.
 
