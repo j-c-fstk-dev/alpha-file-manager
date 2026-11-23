@@ -29,7 +29,7 @@ visual dentro da interface.
 
 ### Pacote de release para Linux x86-64
 
-Extraia o arquivo `alpha-file-manager-v0.3.0-linux-x86_64.tar.gz` e, na pasta extraída, execute:
+Extraia o arquivo `alpha-file-manager-v0.3.1-linux-x86_64.tar.gz` e, na pasta extraída, execute:
 
 ```sh
 ./install-launcher.sh
