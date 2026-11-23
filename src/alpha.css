@@ -3,6 +3,8 @@
    @phosphor_selection and @phosphor_bg. */
 
 .alpha {
+    /* Inter when installed, otherwise the system sans-serif. */
+    font-family: "Inter", sans-serif;
     background-color: @phosphor_bg;
     background-image: linear-gradient(160deg, shade(@phosphor_selection, 0.78), @phosphor_bg 48%, shade(@phosphor_bg, 0.8));
     color: #eef6f1;
@@ -15,8 +17,8 @@
     color: #eef6f1;
     border-bottom: 1px solid alpha(white, 0.07);
     box-shadow: inset 0 -1px alpha(@phosphor, 0.08);
-    min-height: 46px;
-    padding: 0 10px;
+    min-height: 58px;
+    padding: 0 14px 0 10px;
 }
 .alpha headerbar .title {
     font-size: 14px;
@@ -48,7 +50,7 @@
 }
 .alpha headerbar button.suggested-action:hover { background-image: linear-gradient(180deg, shade(@phosphor, 1.2), shade(@phosphor, 1.06)); }
 
-.alpha .glass-toolbar { min-height: 46px; }
+.alpha .glass-toolbar { min-height: 58px; }
 
 /* ---------- Sidebar ---------- */
 .alpha .glass-sidebar {
@@ -225,3 +227,123 @@ menu.alpha menuitem:hover { background-color: alpha(@phosphor, 0.22); }
 .alpha.translucent .glass-sidebar,
 .alpha.translucent headerbar.glass-toolbar { background-color: alpha(#152023, 0.63); }
 .alpha.translucent button.location { background-color: alpha(#263539, 0.58); }
+
+/* ================= Mockup fidelity ================= */
+
+/* Brand block, aligned with the header */
+.alpha .brand-row {
+    padding: 0 18px;
+    border-bottom: 1px solid alpha(white, 0.07);
+    background-image: linear-gradient(180deg, alpha(#1b2a2d, 0.96), alpha(#131d20, 0.94));
+}
+.alpha .brand-name { font-size: 15px; font-weight: 800; color: #f2f8f4; }
+.alpha .brand-product { font-size: 10px; font-weight: 600; letter-spacing: 1.4px; color: #8fa39b; }
+
+/* Search pill in the header */
+.alpha entry.global-search {
+    min-height: 38px;
+    border-radius: 20px;
+    padding: 0 64px 0 12px;
+    background-color: alpha(white, 0.045);
+    border: 1px solid alpha(white, 0.08);
+    box-shadow: none;
+    color: #eef6f1;
+}
+.alpha entry.global-search image { color: #8fa39b; margin-right: 6px; }
+.alpha entry.global-search:focus {
+    border-color: alpha(@phosphor, 0.55);
+    box-shadow: 0 0 0 3px alpha(@phosphor, 0.12);
+}
+.alpha .kbd {
+    font-size: 11px;
+    font-weight: 600;
+    color: #8fa39b;
+    padding: 3px 7px;
+    border-radius: 7px;
+    background-color: alpha(white, 0.06);
+    border: 1px solid alpha(white, 0.08);
+}
+
+/* Sidebar toggle is a visibility switch: no accent fill when on */
+.alpha headerbar button.sidebar-toggle,
+.alpha headerbar button.sidebar-toggle:checked {
+    background-color: transparent;
+    border-color: transparent;
+    box-shadow: none;
+    color: #c9d8d0;
+}
+.alpha headerbar button.sidebar-toggle:checked:hover { background-color: alpha(white, 0.07); }
+.alpha headerbar button.suggested-action { padding: 0 14px 0 12px; min-height: 36px; border-radius: 11px; }
+.alpha headerbar button.suggested-action label { color: #06180f; font-weight: 700; }
+.alpha headerbar button.suggested-action image { color: #06180f; }
+
+/* Sidebar rows */
+.alpha .rail { padding: 6px 10px 12px 10px; }
+.alpha button.side-location { min-height: 38px; padding: 0 10px; }
+.alpha button.side-location label { font-size: 14px; }
+.alpha button.side-location image { color: #9bb3a8; }
+.alpha .rail button.current image { color: @phosphor; }
+.alpha .rail .section-title { margin: 16px 10px 6px 10px; }
+
+/* Home sections */
+.alpha .section-title { font-size: 12px; color: #9fb5aa; letter-spacing: 1.2px; }
+.alpha button.link-action {
+    background-color: transparent;
+    border-color: transparent;
+    box-shadow: none;
+    color: @phosphor;
+    font-weight: 600;
+    padding: 2px 6px;
+}
+.alpha button.link-action:hover { background-color: alpha(@phosphor, 0.08); }
+.alpha flowboxchild { padding: 0; background-color: transparent; }
+
+/* Cards */
+.alpha button.card {
+    padding: 14px;
+    border-radius: 16px;
+    background-color: transparent;
+    background-image: linear-gradient(180deg, alpha(white, 0.035), alpha(white, 0.015));
+    border: 1px solid alpha(white, 0.07);
+    box-shadow: none;
+    color: #eef6f1;
+}
+.alpha button.card:hover {
+    background-image: linear-gradient(180deg, alpha(white, 0.06), alpha(white, 0.03));
+    border-color: alpha(white, 0.13);
+}
+.alpha button.card.pinned-card {
+    background-image: linear-gradient(120deg, alpha(@phosphor, 0.14), alpha(@phosphor, 0.02) 60%);
+    background-color: alpha(#142225, 0.9);
+    border-color: alpha(@phosphor, 0.24);
+}
+.alpha .card-title { font-size: 14.5px; font-weight: 700; color: #eef6f1; }
+.alpha .card-detail { font-size: 12.5px; color: #8fa39b; }
+.alpha .chevron { color: #5d736a; }
+.alpha .pin-badge { font-size: 10.5px; font-weight: 700; letter-spacing: 0.5px; color: @phosphor; }
+
+/* Icon chips */
+.alpha .chip { border-radius: 14px; }
+.alpha .tint-accent { background-color: alpha(@phosphor, 0.13); color: @phosphor; }
+.alpha .pinned-card .tint-accent { background-image: linear-gradient(135deg, alpha(@phosphor, 0.28), alpha(@phosphor, 0.08)); }
+.alpha .tint-cyan { background-color: alpha(#80edff, 0.12); color: #80edff; }
+.alpha .tint-amber { background-color: alpha(#ffc77a, 0.12); color: #ffc77a; }
+.alpha .tint-violet { background-color: alpha(#d6baff, 0.12); color: #d6baff; }
+.alpha .tint-rose { background-color: alpha(#ff9eb5, 0.12); color: #ff9eb5; }
+.alpha .tint-neutral { background-color: alpha(white, 0.06); color: #cfe0d7; }
+
+/* Disk usage bar */
+.alpha progressbar.usage trough {
+    min-height: 6px;
+    border-radius: 99px;
+    background-color: alpha(white, 0.08);
+    border: none;
+    box-shadow: none;
+}
+.alpha progressbar.usage progress {
+    min-height: 6px;
+    border-radius: 99px;
+    background-image: linear-gradient(90deg, shade(@phosphor_selection, 1.4), @phosphor);
+    border: none;
+    box-shadow: none;
+}

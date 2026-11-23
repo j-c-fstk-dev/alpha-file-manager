@@ -38,7 +38,7 @@ pub fn register(browser: &Rc<Browser>) {
     }
 }
 
-fn active(window: &gtk::ApplicationWindow, tabs: &gtk::Notebook) -> Option<Rc<Browser>> {
+pub(crate) fn active(window: &gtk::ApplicationWindow, tabs: &gtk::Notebook) -> Option<Rc<Browser>> {
     let page = tabs.nth_page(tabs.current_page())?;
     let focus = window.focused_widget();
     PANES.with(|panes| {
@@ -361,9 +361,10 @@ pub fn install(
             keys: &[],
         },
     ];
+    // One menu button with a submenu per group keeps the header clean;
+    // every action and accelerator stays the same.
+    let root = gio::Menu::new();
     for group in [file, edit, view, go, help] {
-        let button = gtk::MenuButton::new();
-        button.set_label(group);
         let model = gio::Menu::new();
         for item in items.iter().filter(|item| item.group == group) {
             let detailed = format!("win.{}", item.action);
@@ -381,9 +382,16 @@ pub fn install(
             window.add_action(&action);
             app.set_accels_for_action(&detailed, item.keys);
         }
-        button.set_menu_model(Some(&model));
-        header.pack_start(&button);
+        root.append_submenu(Some(group), &model);
     }
+    let button = gtk::MenuButton::new();
+    button.add(&gtk::Image::from_icon_name(
+        Some("open-menu-symbolic"),
+        gtk::IconSize::Button,
+    ));
+    crate::label_control(&button, tr!("Menu principal", "Main Menu"));
+    button.set_menu_model(Some(&root));
+    header.pack_end(&button);
 }
 
 fn dispatch(

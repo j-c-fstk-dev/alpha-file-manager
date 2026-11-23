@@ -23,6 +23,9 @@ const CHUNK: usize = 1500;
 const THUMBNAIL: i32 = 96;
 /// Width of one cell in the icon view, before zoom.
 const ICON_WIDTH: i32 = 120;
+/// Header height, shared by the sidebar brand row so both bars line up.
+const BAR_HEIGHT: i32 = 58;
+const SIDEBAR_WIDTH: i32 = 220;
 
 #[derive(Clone, Default)]
 struct Transfer {
@@ -377,6 +380,7 @@ impl Browser {
         icon_text.set_property("wrap-width", ICON_WIDTH - 24);
         icon_text.set_property("wrap-mode", gtk::pango::WrapMode::WordChar);
         icon_text.set_property("alignment", gtk::pango::Alignment::Center);
+        icon_text.set_xalign(0.5);
         gtk::prelude::CellLayoutExt::pack_start(&icons, &icon_text, true);
         gtk::prelude::CellLayoutExt::add_attribute(&icons, &icon_text, "text", 1);
         let icon_scroll =
@@ -1545,8 +1549,6 @@ fn main() -> glib::ExitCode {
         window.set_title("Alpha File Manager");
         window.set_default_size(1120, 680);
         let header = gtk::HeaderBar::new();
-        // The app name lives in the window title; the header shows where you are.
-        header.set_title(Some(tr!("Início", "Home")));
         header.style_context().add_class("glass-toolbar");
         let toggle_sidebar = gtk::ToggleButton::new();
         toggle_sidebar.add(&gtk::Image::from_icon_name(
@@ -1558,8 +1560,24 @@ fn main() -> glib::ExitCode {
             tr!("Mostrar barra lateral", "Show Sidebar"),
         );
         toggle_sidebar.set_active(true);
+        toggle_sidebar.style_context().add_class("sidebar-toggle");
         header.pack_start(&toggle_sidebar);
-        let new_tab = icon_button("list-add-symbolic", tr!("Nova aba", "New Tab"));
+        let new_tab = gtk::Button::new();
+        let new_tab_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        new_tab_row.pack_start(
+            &gtk::Image::from_icon_name(Some("list-add-symbolic"), gtk::IconSize::Button),
+            false,
+            false,
+            0,
+        );
+        new_tab_row.pack_start(
+            &gtk::Label::new(Some(tr!("Nova aba", "New Tab"))),
+            false,
+            false,
+            0,
+        );
+        new_tab.add(&new_tab_row);
+        label_control(&new_tab, tr!("Nova aba (Ctrl+T)", "New Tab (Ctrl+T)"));
         new_tab.style_context().add_class("suggested-action");
         header.pack_end(&new_tab);
         let settings = icon_button("emblem-system-symbolic", tr!("Configurações", "Settings"));
@@ -1579,17 +1597,27 @@ fn main() -> glib::ExitCode {
         let rail = gtk::Box::new(gtk::Orientation::Vertical, 8);
         rail.style_context().add_class("rail");
         let loader = gtk::gdk_pixbuf::PixbufLoader::new();
-        loader.set_size(38, 38);
+        loader.set_size(34, 34);
         let _ = loader.write(include_bytes!("../assets/alpha-file-manager.svg"));
         let _ = loader.close();
         let brand = gtk::Image::from_pixbuf(loader.pixbuf().as_ref());
         let sidebar_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar_column.style_context().add_class("glass-sidebar");
-        let brand_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let brand_row = gtk::Box::new(gtk::Orientation::Horizontal, 11);
         brand_row.style_context().add_class("brand-row");
-        brand_row.set_height_request(49);
-        brand_row.set_halign(gtk::Align::Center);
+        brand_row.set_height_request(BAR_HEIGHT);
         brand_row.pack_start(&brand, false, false, 0);
+        let wordmark = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        wordmark.set_valign(gtk::Align::Center);
+        let brand_name = gtk::Label::new(Some("Alpha"));
+        brand_name.set_xalign(0.0);
+        brand_name.style_context().add_class("brand-name");
+        let brand_product = gtk::Label::new(Some("FILE MANAGER"));
+        brand_product.set_xalign(0.0);
+        brand_product.style_context().add_class("brand-product");
+        wordmark.pack_start(&brand_name, false, false, 0);
+        wordmark.pack_start(&brand_product, false, false, 0);
+        brand_row.pack_start(&wordmark, false, false, 0);
         sidebar_column.pack_start(&brand_row, false, false, 0);
         let home = location_button("go-home-symbolic", tr!("Início", "Home"), true);
         let files = location_button("folder-symbolic", tr!("Arquivos", "Files"), true);
@@ -1597,7 +1625,7 @@ fn main() -> glib::ExitCode {
         rail.pack_start(&files, false, false, 0);
         let sidebar = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
         sidebar.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        sidebar.set_width_request(172);
+        sidebar.set_width_request(SIDEBAR_WIDTH);
         sidebar.add(&rail);
         sidebar_column.pack_start(&sidebar, true, true, 0);
         let sidebar_revealer = gtk::Revealer::new();
@@ -1635,6 +1663,7 @@ fn main() -> glib::ExitCode {
             transfer: transfer.clone(),
         };
         commands::install(&window, app, &header, &navigation, &toggle_sidebar);
+        header.set_custom_title(Some(&global_search(&window, app, &navigation)));
         add_sidebar_locations(&rail, &navigation);
         let dashboard = dashboard(&navigation);
         stack.add_named(&dashboard, "home");
@@ -1673,16 +1702,8 @@ fn main() -> glib::ExitCode {
         });
         let home_control = home.downgrade();
         let files_control = files.downgrade();
-        let header_control = header.downgrade();
         let update_rail = move |stack: &gtk::Stack| {
             let active = stack.visible_child_name();
-            if let Some(header) = header_control.upgrade() {
-                header.set_title(Some(if active.as_deref() == Some("files") {
-                    tr!("Arquivos", "Files")
-                } else {
-                    tr!("Início", "Home")
-                }));
-            }
             for (name, control) in [("home", &home_control), ("files", &files_control)] {
                 if let Some(button) = control.upgrade() {
                     if active.as_deref() == Some(name) {
@@ -1833,7 +1854,12 @@ fn location_button(icon: &str, name: &str, compact: bool) -> gtk::Button {
     } else {
         gtk::IconSize::LargeToolbar
     };
-    row.add(&gtk::Image::from_icon_name(Some(icon), size));
+    let image = if compact {
+        gtk::Image::from_icon_name(Some(&symbolic(icon)), size)
+    } else {
+        gtk::Image::from_icon_name(Some(icon), size)
+    };
+    row.add(&image);
     let label = gtk::Label::new(Some(name));
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.set_max_width_chars(if compact { 16 } else { 24 });
@@ -1852,7 +1878,11 @@ fn location(
     compact: bool,
     pinned: bool,
 ) -> gtk::Button {
-    let button = location_button(icon, name, compact);
+    let button = if compact {
+        location_button(icon, name, compact)
+    } else {
+        card_button(icon, name, &path, pinned)
+    };
     button.set_tooltip_text(Some(&path.to_string_lossy()));
     let target = path.clone();
     let open = navigation.clone();
@@ -1924,7 +1954,8 @@ fn pinned_locations(container: &impl IsA<gtk::Container>, navigation: &Navigatio
 }
 
 fn section(name: &str) -> gtk::Label {
-    let label = gtk::Label::new(Some(name));
+    // GTK3 CSS has no text-transform, so the uppercase style is applied here.
+    let label = gtk::Label::new(Some(&name.to_uppercase()));
     label.set_xalign(0.0);
     label.style_context().add_class("section-title");
     label
@@ -1950,13 +1981,15 @@ fn add_sidebar_locations(rail: &gtk::Box, navigation: &Navigation) {
     pinned_locations(&pins, navigation, true);
 }
 
-fn card_grid() -> gtk::FlowBox {
+/// `min == max == 2` makes a single card span half the width (two of four columns).
+fn card_grid(min: u32, max: u32) -> gtk::FlowBox {
     let cards = gtk::FlowBox::new();
     cards.set_selection_mode(gtk::SelectionMode::None);
     cards.set_homogeneous(true);
-    cards.set_max_children_per_line(4);
-    cards.set_row_spacing(10);
-    cards.set_column_spacing(10);
+    cards.set_min_children_per_line(min);
+    cards.set_max_children_per_line(max);
+    cards.set_row_spacing(12);
+    cards.set_column_spacing(12);
     cards
 }
 
@@ -1969,7 +2002,9 @@ fn dashboard(navigation: &Navigation) -> gtk::ScrolledWindow {
 
     let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     heading.pack_start(&section(tr!("Fixados", "Pinned")), true, true, 0);
-    let add = gtk::Button::with_label(tr!("Adicionar pasta", "Add Folder"));
+    let add = gtk::Button::with_label(tr!("+ Adicionar pasta", "+ Add Folder"));
+    add.style_context().add_class("link-action");
+    add.set_valign(gtk::Align::Center);
     heading.pack_end(&add, false, false, 0);
     content.pack_start(&heading, false, false, 0);
     add.connect_clicked(|button| {
@@ -1997,34 +2032,308 @@ fn dashboard(navigation: &Navigation) -> gtk::ScrolledWindow {
             }
         }
     });
-    let pinned = card_grid();
+    let pinned = card_grid(2, 2);
     pinned.set_no_show_all(true);
     content.pack_start(&pinned, false, false, 0);
     pinned_locations(&pinned, navigation, false);
 
-    for (heading, locations) in [
-        (
-            tr!("Pastas pessoais", "Personal Folders"),
-            standard_locations(),
-        ),
-        (
-            tr!("Sistema", "System"),
-            vec![(
-                tr!("Sistema de arquivos", "File System"),
-                "drive-harddisk",
-                PathBuf::from("/"),
-            )],
-        ),
-    ] {
-        content.pack_start(&section(heading), false, false, 0);
-        let cards = card_grid();
-        for (name, icon, path) in locations {
-            cards.add(&location(navigation, icon, name, path, false, false));
-        }
-        content.pack_start(&cards, false, false, 0);
+    content.pack_start(
+        &section(tr!("Pastas pessoais", "Personal Folders")),
+        false,
+        false,
+        0,
+    );
+    let cards = card_grid(2, 4);
+    for (name, icon, path) in standard_locations() {
+        cards.add(&location(navigation, icon, name, path, false, false));
     }
+    content.pack_start(&cards, false, false, 0);
+
+    content.pack_start(&section(tr!("Sistema", "System")), false, false, 0);
+    let system = card_grid(2, 2);
+    system.add(&disk_card(navigation));
+    content.pack_start(&system, false, false, 0);
     scroll.add(&content);
     scroll
+}
+
+/// Monochrome icon name, as in the mockup's line icons.
+fn symbolic(icon: &str) -> String {
+    let icon = match icon {
+        "folder-bookmark" => "folder",
+        other => other,
+    };
+    if icon.ends_with("-symbolic") {
+        icon.to_owned()
+    } else {
+        format!("{icon}-symbolic")
+    }
+}
+
+/// Colour of the icon chip on a home card.
+fn tint(icon: &str) -> &'static str {
+    match icon {
+        "user-home" | "folder-videos" | "folder-bookmark" => "tint-accent",
+        "user-desktop" | "folder-music" => "tint-cyan",
+        "folder-download" => "tint-amber",
+        "folder-documents" => "tint-violet",
+        "folder-pictures" => "tint-rose",
+        _ => "tint-neutral",
+    }
+}
+
+fn chip(icon: &str) -> gtk::Box {
+    let chip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    chip.style_context().add_class("chip");
+    chip.style_context().add_class(tint(icon));
+    chip.set_size_request(44, 44);
+    chip.set_valign(gtk::Align::Center);
+    let image = gtk::Image::from_icon_name(Some(&symbolic(icon)), gtk::IconSize::LargeToolbar);
+    image.set_pixel_size(22);
+    image.set_halign(gtk::Align::Center);
+    image.set_valign(gtk::Align::Center);
+    chip.pack_start(&image, true, true, 0);
+    chip
+}
+
+/// `~/Downloads` instead of `/home/user/Downloads`.
+fn display_path(path: &Path) -> String {
+    let home = glib::home_dir();
+    match path.strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// 1204 -> "1.204" (pt) or "1,204" (en).
+fn group_digits(value: usize) -> String {
+    let separator = if i18n::portuguese() { '.' } else { ',' };
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (position, digit) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            grouped.push(separator);
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// Counts visible entries on a worker thread, then appends the count to `label`.
+fn count_entries_async(path: PathBuf, label: &gtk::Label) {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let count = fs::read_dir(&path).ok().map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+                .count()
+        });
+        let _ = sender.send(count);
+    });
+    let label = label.downgrade();
+    glib::timeout_add_local(Duration::from_millis(40), move || {
+        match receiver.try_recv() {
+            Err(TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) | Ok(None) => {}
+            Ok(Some(count)) => {
+                if let Some(label) = label.upgrade() {
+                    let place = label.text();
+                    label.set_text(&if count == 1 {
+                        trf!("{} · 1 item", "{} · 1 item", place)
+                    } else {
+                        trf!("{} · {} itens", "{} · {} items", place, group_digits(count))
+                    });
+                }
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn card_text(title: &str) -> (gtk::Box, gtk::Label) {
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    text.set_valign(gtk::Align::Center);
+    let heading = gtk::Label::new(Some(title));
+    heading.set_xalign(0.0);
+    heading.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    heading.style_context().add_class("card-title");
+    text.pack_start(&heading, false, false, 0);
+    (text, heading)
+}
+
+/// Home card: coloured icon chip, title, path and item count, chevron.
+fn card_button(icon: &str, name: &str, path: &Path, pinned: bool) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.style_context().add_class("card");
+    if pinned {
+        button.style_context().add_class("pinned-card");
+    }
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    row.pack_start(&chip(icon), false, false, 0);
+    let (text, _) = card_text(name);
+    let detail = gtk::Label::new(Some(&display_path(path)));
+    detail.set_xalign(0.0);
+    detail.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    detail.style_context().add_class("card-detail");
+    text.pack_start(&detail, false, false, 0);
+    row.pack_start(&text, true, true, 0);
+    if pinned {
+        let badge = gtk::Label::new(Some(&tr!("Fixado", "Pinned").to_uppercase()));
+        badge.style_context().add_class("pin-badge");
+        badge.set_valign(gtk::Align::Start);
+        row.pack_start(&badge, false, false, 0);
+    }
+    let chevron = gtk::Image::from_icon_name(Some("go-next-symbolic"), gtk::IconSize::Button);
+    chevron.style_context().add_class("chevron");
+    chevron.set_valign(gtk::Align::Center);
+    row.pack_start(&chevron, false, false, 0);
+    button.add(&row);
+    label_control(&button, name);
+    count_entries_async(path.to_owned(), &detail);
+    button
+}
+
+/// System card: free space and a usage bar for the root file system.
+fn disk_card(navigation: &Navigation) -> gtk::Button {
+    let root = PathBuf::from("/");
+    let button = gtk::Button::new();
+    button.style_context().add_class("card");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    row.pack_start(&chip("drive-harddisk"), false, false, 0);
+    let name = tr!("Sistema de arquivos", "File System");
+    let (text, _) = card_text(name);
+    let (size, free) = gio::File::for_path(&root)
+        .query_filesystem_info("filesystem::size,filesystem::free", gio::Cancellable::NONE)
+        .map(|info| {
+            (
+                info.attribute_uint64("filesystem::size"),
+                info.attribute_uint64("filesystem::free"),
+            )
+        })
+        .unwrap_or_default();
+    if size > 0 {
+        // Title and free space share the first line, as in the mockup.
+        let first = text.children().into_iter().next();
+        if let Some(heading) = first {
+            text.remove(&heading);
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            line.pack_start(&heading, true, true, 0);
+            let space = gtk::Label::new(Some(&trf!(
+                "{} livres de {}",
+                "{} free of {}",
+                format_size(free),
+                format_size(size)
+            )));
+            space.style_context().add_class("card-detail");
+            line.pack_end(&space, false, false, 0);
+            text.pack_start(&line, false, false, 0);
+        }
+        let usage = gtk::ProgressBar::new();
+        usage.style_context().add_class("usage");
+        usage.set_fraction(size.saturating_sub(free) as f64 / size as f64);
+        usage.set_valign(gtk::Align::Center);
+        text.pack_start(&usage, false, false, 4);
+    }
+    row.pack_start(&text, true, true, 0);
+    button.add(&row);
+    label_control(&button, name);
+    button.set_tooltip_text(Some("/"));
+    let open = navigation.clone();
+    button.connect_clicked(move |_| open.open(&root));
+    button
+}
+
+/// Header search. A path (`/…` or `~/…`) opens that folder; a file path opens its folder
+/// filtered to it; anything else filters the current folder. Ctrl+K focuses it.
+fn global_search(
+    window: &gtk::ApplicationWindow,
+    app: &gtk::Application,
+    navigation: &Navigation,
+) -> gtk::Overlay {
+    let entry = gtk::Entry::new();
+    entry.style_context().add_class("global-search");
+    entry.set_placeholder_text(Some(tr!(
+        "Buscar ou digitar um caminho…",
+        "Search or type a path…"
+    )));
+    entry.set_primary_icon_name(Some("system-search-symbolic"));
+    entry.set_width_chars(48);
+    label_control(
+        &entry,
+        tr!("Buscar ou ir para um caminho", "Search or go to a path"),
+    );
+    let hint = gtk::Label::new(Some("Ctrl K"));
+    hint.style_context().add_class("kbd");
+    hint.set_halign(gtk::Align::End);
+    hint.set_valign(gtk::Align::Center);
+    hint.set_margin_end(9);
+    let overlay = gtk::Overlay::new();
+    overlay.add(&entry);
+    overlay.add_overlay(&hint);
+    overlay.set_overlay_pass_through(&hint, true);
+    overlay.set_valign(gtk::Align::Center);
+    let hint_control = hint.downgrade();
+    entry.connect_changed(move |entry| {
+        if let Some(hint) = hint_control.upgrade() {
+            hint.set_opacity(if entry.text().is_empty() { 1.0 } else { 0.0 });
+        }
+    });
+
+    let owner = window.downgrade();
+    let navigation = navigation.clone();
+    entry.connect_activate(move |entry| {
+        let text = entry.text().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        let (Some(window), Some(stack), Some(tabs)) = (
+            owner.upgrade(),
+            navigation.stack.upgrade(),
+            navigation.tabs.upgrade(),
+        ) else {
+            return;
+        };
+        let path = match text.as_str() {
+            "~" => Some(glib::home_dir()),
+            text if text.starts_with("~/") => Some(glib::home_dir().join(&text[2..])),
+            text if text.starts_with('/') => Some(PathBuf::from(text)),
+            _ => None,
+        };
+        if tabs.n_pages() == 0 {
+            open_tab(&tabs, &glib::home_dir(), navigation.transfer.clone());
+        }
+        stack.set_visible_child_name("files");
+        let Some(browser) = commands::active(&window, &tabs) else {
+            return;
+        };
+        match path {
+            Some(path) if path.is_dir() => {
+                browser.navigate(&path, true);
+            }
+            Some(path) => {
+                if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                    if browser.navigate(parent, true) {
+                        browser.filter.set_text(&name.to_string_lossy());
+                    }
+                }
+            }
+            None => browser.filter.set_text(&text),
+        }
+        entry.set_text("");
+    });
+
+    let focus = gio::SimpleAction::new("focus-search", None);
+    let target = entry.downgrade();
+    focus.connect_activate(move |_, _| {
+        if let Some(entry) = target.upgrade() {
+            entry.grab_focus();
+        }
+    });
+    window.add_action(&focus);
+    app.set_accels_for_action("win.focus-search", &["<Primary>k"]);
+    overlay
 }
 
 fn show_error(widget: &impl IsA<gtk::Widget>, message: &str) {
@@ -2173,6 +2482,14 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(hidden.iter().filter(|flag| **flag).count(), 1);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn card_paths_are_shortened_under_home() {
+        let home = glib::home_dir();
+        assert_eq!(display_path(&home), "~");
+        assert_eq!(display_path(&home.join("Downloads")), "~/Downloads");
+        assert_eq!(display_path(Path::new("/etc")), "/etc");
     }
 
     #[test]
